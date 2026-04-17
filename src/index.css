@@ -1,0 +1,35 @@
+:root {
+  color: #141923;
+  background-color: #fffaf4;
+  line-height: 1.45;
+  font-weight: 400;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(circle at 12% 8%, rgba(244, 191, 99, 0.22) 0%, transparent 36%),
+    radial-gradient(circle at 88% 86%, rgba(31, 183, 166, 0.16) 0%, transparent 40%),
+    linear-gradient(180deg, #fffaf4 0%, #f4ecdf 100%);
+}
+
+::selection {
+  background: rgba(249, 115, 82, 0.24);
+  color: #1f2838;
+}
+
+#root {
+  min-height: 100vh;
+}
