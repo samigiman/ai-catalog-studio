@@ -56,43 +56,46 @@ Browser-də açın: `http://127.0.0.1:3007` (və ya terminalda göstərilən lin
    - Sekil upload ile secilen kartlarda upload sekli cedvelde gosterilir.
    - CSV export-da `image_link` ucun yalniz public `http/https` URL istifade olunur; lokal `blob:` URL varsa feed `image_link` fallback edilir.
 
-## Batch sekil adindan axtaris
+## Batch sekil analizi ve AI matching
 
-- `Sekilleri yukle ve adla axtar` ile coxlu sekil secin.
-- Bir batch-da maksimum `300` sekil emal olunur.
-- Sistem her sekil adindan sorgu cixarib feed-de mehsul tapir.
-- 1 netice olarsa avtomatik cedvele elave edir.
-- 2+ netice olarsa sekil kartinin altinda namized mehsullar gorunur, siz uygun olani secirsiniz.
-- Namized mehsullarda `Reng` melumati da gosterilir ki secim daha rahat olsun.
-- Secildikden sonra kartda `Secilen reng` ayrica gosterilir.
-- `Tovsiyeni sec` ve `Top 1-leri toplu sec` secimi AI reng ipucunu da nezere alir.
-- Eger fayl adi yeterli olmazsa AI vision ile sekil uzerinden mehsul adini oxuyub axtarisi guclendirir (fallback OCR).
-- `Uygun mehsul tapilmadi` kartlarinda manual input ile ad yazib tekrar axtar etmek mumkundur.
-- Yanlis secim etdikde kart uzerinden `Sechimi deyish` ile geri qaytarib yeniden secmek olur.
-- Cox secim oldugunda `Top 1-leri toplu sec` duymesi ile butun kartlarda ilk namized bir klikle secilir.
+- `Şəkilləri seç` ilə çoxlu şəkil yükləyin.
+- Bir batch-da maksimum `300` şəkil emal olunur.
+- Yeni AI pipeline 3 mərhələdə işləyir:
+  - Şəkildən detallı məhsul profili çıxarır: brend, seriya/model, storage, rəng, görünən mətn, kateqoriya
+  - Feed-dən top namizədləri yığır
+  - Lazım olanda AI ilə bu namizədlər arasında ayrıca seçim edib ən uyğun `content_id`-ni önə çəkir
+- Uyğun kartlarda Meta üçün `title` və `description` draft-ları da hazırlanır.
+- `AI pick` olan kartlarda sistem uyğun namizədi önə çəkir; istəsən əl ilə başqa variant da seçə bilərsən.
+- `Feed-də tapılmayanlar` ayrıca sütunda saxlanılır ki manual axtarış rahat olsun.
+- `Top seçimi tətbiq et` ilə review-də qalan kartlarda birinci namizədi toplu seçmək olur.
 
-## AI vision ucun (Gemini) setup
+## AI setup
 
-AI ile sekilden ad oxuma dev proxy uzerinden gedir. API acari frontend-e cixmir.
+AI analiz dev proxy üzərindən gedir; API açarları frontend-ə çıxmır.
 
-`.env` faylina elave edin:
+### Gemini ile
 
 ```bash
 GEMINI_API_KEY=...
-VITE_GEMINI_MODEL=gemini-3-flash-preview
-VITE_GEMINI_MODELS=gemini-3-flash-preview,gemini-3.1-pro-preview,gemini-2.5-pro,gemini-2.5-flash
+VITE_GEMINI_MODEL=gemini-3.1-pro-preview
+VITE_GEMINI_MODELS=gemini-3.1-pro-preview,gemini-3-flash-preview,gemini-2.5-pro,gemini-2.5-flash
 ```
 
-Optional fallback:
+### OpenAI ile
 
 ```bash
 OPENAI_API_KEY=sk-...
-VITE_OPENAI_VISION_MODEL=gpt-4.1-mini
+VITE_OPENAI_VISION_MODEL=gpt-5.4
+VITE_OPENAI_VISION_MODELS=gpt-5.4,gpt-5.2,gpt-5.1,gpt-5-mini,gpt-4.1
 ```
 
-Qeyd: sistem evvel model siyahisini yoxlayib en guclu uygun Gemini modeline kecir.
-Gemini 3 ucun image analiz keyfiyyeti artirmaq meqsedi ile `mediaResolution=high` istifade olunur.
-API key yoxdursa sistem avtomatik fallback OCR istifade edir.
+Qeyd:
+
+- `VITE_OPENAI_VISION_MODEL` verilibsə sistem əvvəl OpenAI modelini yoxlayır.
+- Hazırkı default prioritet `gemini-3.1-pro-preview` modelidir.
+- Sistem əvvəl Gemini model siyahısını yoxlayır, sonra OpenAI-ni fallback kimi sınayır.
+- Gemini analizi alınmasa kart AI nəticəsiz qalır və manual review ilə həll olunur.
+- AI analizi həm matching üçün, həm də Meta draft generation üçün istifadə olunur.
 
 ## Qeyd
 

@@ -3,7 +3,7 @@ const URL_RE = /https?:\/\/[^\s,;]+/gi
 function cleanToken(value: string): string {
   return value
     .trim()
-    .replace(/^['"<\[]+/, '')
+    .replace(/^['"<[]+/, '')
     .replace(/[>'"\]]+$/, '')
 }
 

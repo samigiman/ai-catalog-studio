@@ -27,10 +27,16 @@ import {
   uploadImageToGoogleDrive,
 } from './googleDrive'
 import { clearLivePriceCache, getLivePriceForItem } from './livePricing'
-import { analyzeProductImageAi, type ImageProductAnalysis } from './imageNameReader'
+import {
+  analyzeProductImageAi,
+  chooseBestCatalogCandidateAi,
+  type CatalogCandidateDecision,
+  type ImageProductAnalysis,
+} from './imageNameReader'
 import { appendMediaEntries, parseMediaEntries } from './media'
 import type { CatalogRow } from './types'
 import './App.css'
+import './Workspace.css'
 
 const FEED_URL = '/proxy-products.xml'
 const GOOGLE_DRIVE_CLIENT_ID = (
@@ -73,7 +79,7 @@ const HEADERS: { key: keyof CatalogRow; label: string; wide?: boolean }[] = [
 const VIDEO_EXT = /\.(mp4|mov|webm|m4v)(\?|$)/i
 const MAX_UPLOAD_FILES_PER_BATCH = 300
 const MAX_AI_READ_FILES_PER_BATCH = 300
-const AI_READ_CONCURRENCY = 4
+const AI_READ_CONCURRENCY = 3
 const MEDIA_UPLOAD_CONCURRENCY = 3
 const UPLOAD_PROCESS_CHUNK_SIZE = 40
 const SHOW_LEGACY_CONSOLE = false
@@ -99,6 +105,7 @@ type UploadMatchCard = {
   mediaUploadError?: string
   aiAnalysis?: ImageProductAnalysis
   aiMatchNote?: string
+  aiDecision?: CatalogCandidateDecision
 }
 
 type CandidateRankEntry = {
@@ -535,11 +542,19 @@ function buildAnalysisQueries(
 ): string[] {
   const queries = [
     analysis?.searchQuery ?? '',
-    [analysis?.brand, analysis?.model, analysis?.variant, analysis?.storage]
+    [
+      analysis?.brand,
+      analysis?.series,
+      analysis?.model,
+      analysis?.variant,
+      analysis?.storage,
+    ]
       .filter(Boolean)
       .join(' '),
-    [analysis?.brand, analysis?.model].filter(Boolean).join(' '),
+    [analysis?.brand, analysis?.series, analysis?.model].filter(Boolean).join(' '),
+    analysis?.productName ?? '',
     baseQuery,
+    analysis?.visibleText ?? '',
     analysis?.rawText ?? '',
   ]
 
@@ -561,7 +576,9 @@ function rankCandidatesForUpload(
 
   const analysisColorHint = buildColorHint(baseQuery, analysis?.searchQuery, analysis?.color)
   const analysisColorGroups = colorGroupsFromText(analysisColorHint)
-  const modelTokens = toSearchTokens([analysis?.model, analysis?.variant].filter(Boolean).join(' '))
+  const modelTokens = toSearchTokens(
+    [analysis?.series, analysis?.model, analysis?.variant].filter(Boolean).join(' '),
+  )
   const storageTokens = storageTokensFromText(
     [analysis?.storage, analysis?.searchQuery, baseQuery].filter(Boolean).join(' '),
   )
@@ -659,34 +676,108 @@ function shouldAutoSelectCandidate(
 
 function buildAiAnalysisChips(analysis?: ImageProductAnalysis): string[] {
   if (!analysis) return []
-  const confidenceLabel =
-    analysis.confidence === 'high'
-      ? 'yüksək'
-      : analysis.confidence === 'medium'
-        ? 'orta'
-        : 'aşağı'
+  const confidenceLabel = describeConfidence(analysis.confidence)
+  const engineLabel = normalizeEngineLabel(analysis.engine)
   return [
+    engineLabel ? `Mühərrik: ${engineLabel}` : '',
     analysis.brand ? `Brend: ${analysis.brand}` : '',
+    analysis.series ? `Seriya: ${analysis.series}` : '',
     analysis.model ? `Model: ${analysis.model}` : '',
     analysis.variant ? `Variant: ${analysis.variant}` : '',
     analysis.storage ? `Yaddaş: ${analysis.storage}` : '',
     analysis.color ? `Rəng: ${analysis.color}` : '',
+    analysis.category ? `Kateqoriya: ${analysis.category}` : '',
+    analysis.condition ? `Vəziyyət: ${analysis.condition}` : '',
     `AI etibarı: ${confidenceLabel}`,
   ].filter(Boolean)
 }
 
-function buildAiMatchNote(card: Pick<UploadMatchCard, 'aiAnalysis' | 'colorHint'>): string {
+function describeConfidence(confidence: CatalogCandidateDecision['confidence']): string {
+  if (confidence === 'high') return 'yüksək'
+  if (confidence === 'medium') return 'orta'
+  return 'aşağı'
+}
+
+function normalizeEngineLabel(engine: string): string {
+  const normalized = engine.trim().toLowerCase()
+  if (!normalized) return ''
+  if (normalized.includes('gemini-3.1')) return 'Gemini 3.1 Pro'
+  if (normalized.includes('gemini-3')) return 'Gemini 3'
+  if (normalized.includes('gemini-2.5')) return 'Gemini 2.5'
+  if (normalized.includes('gpt-5')) return 'GPT-5'
+  if (normalized.includes('gpt-4.1')) return 'GPT-4.1'
+  return engine
+}
+
+function reorderCandidatesByDecision(
+  candidates: ParsedItem[],
+  decision?: CatalogCandidateDecision,
+): ParsedItem[] {
+  const selectedId = decision?.selectedContentId?.trim()
+  if (!selectedId) return candidates
+  const chosen = candidates.find((candidate) => candidate.contentId === selectedId)
+  if (!chosen) return candidates
+  return [chosen, ...candidates.filter((candidate) => candidate.contentId !== selectedId)]
+}
+
+function buildAiMetaPreview(analysis?: ImageProductAnalysis): string {
+  if (!analysis) return ''
+  if (analysis.metaDescription) return analysis.metaDescription
+  if (analysis.metaTitle) return analysis.metaTitle
+  return ''
+}
+
+function shouldUseAiMetaTitle(item: ParsedItem, analysis?: ImageProductAnalysis | null): boolean {
+  const candidate = analysis?.metaTitle?.trim()
+  if (!candidate) return false
+
+  const itemTokens = new Set(toSearchTokens(item.title))
+  const aiTokens = toSearchTokens(candidate)
+  if (aiTokens.length === 0 || itemTokens.size === 0) return false
+
+  const overlap = aiTokens.filter((token) => itemTokens.has(token)).length
+  return overlap >= Math.max(2, Math.ceil(Math.min(aiTokens.length, itemTokens.size) / 2))
+}
+
+function applyAiDraftToCatalogRow(
+  row: CatalogRow,
+  item: ParsedItem,
+  analysis?: ImageProductAnalysis | null,
+): CatalogRow {
+  if (!analysis) return row
+
+  return {
+    ...row,
+    title: shouldUseAiMetaTitle(item, analysis) ? analysis.metaTitle : row.title,
+    description: analysis.metaDescription || row.description,
+    brand: row.brand || analysis.brand,
+    fbProductCategory: row.fbProductCategory || analysis.fbProductCategoryHint,
+  }
+}
+
+function buildAiMatchNote(
+  card: Pick<UploadMatchCard, 'aiAnalysis' | 'aiDecision' | 'colorHint'>,
+): string {
   const analysis = card.aiAnalysis
+  if (card.aiDecision?.selectedContentId) {
+    const confidenceLabel = describeConfidence(card.aiDecision.confidence)
+    const reason = card.aiDecision.reason ? ` • ${card.aiDecision.reason}` : ''
+    return `AI seçimi: ${confidenceLabel}${reason}`
+  }
+
   if (!analysis) {
-    return card.colorHint ? `Rəng ipucu: ${card.colorHint}` : 'AI analizi alınmadı.'
+    return card.colorHint
+      ? `Gemini analizi alınmadı • Rəng ipucu: ${card.colorHint}`
+      : 'Gemini analizi alınmadı.'
   }
 
   const parts = [
-    analysis.searchQuery ? `Axtarış: ${analysis.searchQuery}` : '',
+    analysis.searchQuery ? `Sorgu: ${analysis.searchQuery}` : '',
     analysis.color || card.colorHint
       ? `Rəng: ${analysis.color || card.colorHint}`
       : '',
     analysis.category ? `Kateqoriya: ${analysis.category}` : '',
+    analysis.matchSignals[0] ? `İz: ${analysis.matchSignals[0]}` : '',
   ].filter(Boolean)
 
   return parts.join(' • ')
@@ -841,8 +932,6 @@ function App() {
   const uploadPublicPromiseByIdRef = useRef<Record<string, Promise<string | null>>>({})
   const uploadDriveUrlByIdRef = useRef<Record<string, string>>({})
   const uploadDrivePromiseByIdRef = useRef<Record<string, Promise<string | null>>>({})
-  const ocrWorkerPromiseRef = useRef<Promise<any> | null>(null)
-  const ocrQueueRef = useRef<Promise<void>>(Promise.resolve())
   const productColorMapPromiseRef = useRef<Promise<Record<string, string>> | null>(null)
 
   const matches = useMemo(
@@ -880,6 +969,42 @@ function App() {
     return stats
   }, [uploadMatches])
 
+  const aiInsightStats = useMemo(
+    () =>
+      uploadMatches.reduce(
+        (stats, card) => {
+          if (card.aiAnalysis) stats.analyzed += 1
+          if (card.aiDecision?.selectedContentId) stats.decided += 1
+          if (card.aiAnalysis?.metaDescription || card.aiAnalysis?.metaTitle) stats.metaDrafts += 1
+          if (
+            card.aiDecision?.confidence === 'high' ||
+            card.aiAnalysis?.confidence === 'high'
+          ) {
+            stats.highConfidence += 1
+          }
+          return stats
+        },
+        {
+          analyzed: 0,
+          decided: 0,
+          metaDrafts: 0,
+          highConfidence: 0,
+        },
+      ),
+    [uploadMatches],
+  )
+
+  const configuredAiPrimaryLabel = useMemo(() => {
+    const geminiModel = (import.meta.env.VITE_GEMINI_MODEL as string | undefined)?.trim()
+    if (geminiModel) return geminiModel
+
+    const openAiModel = (
+      import.meta.env.VITE_OPENAI_VISION_MODEL as string | undefined
+    )?.trim()
+    if (openAiModel) return openAiModel
+    return 'gemini-3.1-pro-preview'
+  }, [])
+
   const mediaLabReadyCounts = useMemo(() => {
     return Object.fromEntries(
       MEDIA_LAB_MODES.map((mode) => {
@@ -905,66 +1030,6 @@ function App() {
     [],
   )
 
-  useEffect(
-    () => () => {
-      const workerPromise = ocrWorkerPromiseRef.current
-      if (workerPromise) {
-        workerPromise
-          .then((worker) => worker.terminate())
-          .catch(() => {})
-      }
-    },
-    [],
-  )
-
-  const extractImageQueryFallback = useCallback(async (file: File): Promise<string> => {
-    let release = () => {}
-    try {
-      const previous = ocrQueueRef.current
-      ocrQueueRef.current = new Promise<void>((resolve) => {
-        release = resolve
-      })
-      await previous
-
-      const getWorker = async () => {
-        if (!ocrWorkerPromiseRef.current) {
-          ocrWorkerPromiseRef.current = (async () => {
-            const { createWorker } = await import('tesseract.js')
-            return createWorker('eng')
-          })().catch((error) => {
-            ocrWorkerPromiseRef.current = null
-            throw error
-          })
-        }
-        return ocrWorkerPromiseRef.current
-      }
-
-      const runOcr = async () => {
-        const worker = await getWorker()
-        const result = await worker.recognize(file)
-        return queryFromOcrText(result.data.text ?? '')
-      }
-
-      try {
-        return await runOcr()
-      } catch {
-        const brokenWorker = ocrWorkerPromiseRef.current
-        ocrWorkerPromiseRef.current = null
-        if (brokenWorker) {
-          brokenWorker
-            .then((worker) => worker.terminate())
-            .catch(() => {})
-        }
-        return await runOcr().catch(() => '')
-      }
-    } catch {
-      return ''
-    } finally {
-      // Keep OCR operations serialized to avoid worker collisions in big batches.
-      release()
-    }
-  }, [])
-
   const analyzeUploadImage = useCallback(
     async (
       file: File,
@@ -979,30 +1044,11 @@ function App() {
           return { query, analysis: { ...analysis, searchQuery: query } }
         }
       } catch {
-        // fall through to OCR fallback
-      }
-
-      const ocrQuery = await extractImageQueryFallback(file)
-      if (!ocrQuery) {
         return { query: '', analysis: null }
       }
-
-      return {
-        query: ocrQuery,
-        analysis: {
-          rawText: ocrQuery,
-          searchQuery: ocrQuery,
-          brand: '',
-          model: '',
-          variant: '',
-          storage: '',
-          color: '',
-          category: '',
-          confidence: 'low',
-        },
-      }
+      return { query: '', analysis: null }
     },
-    [extractImageQueryFallback],
+    [],
   )
 
   const loadFeedItems = useCallback(async (): Promise<ParsedItem[]> => {
@@ -1318,8 +1364,17 @@ function App() {
   )
 
   const buildRowForUploadSelection = useCallback(
-    async (uploadId: string, item: ParsedItem, previewUrl?: string): Promise<CatalogRow> => {
-      const priced = await buildRowWithLivePricing(item)
+    async (
+      uploadId: string,
+      item: ParsedItem,
+      previewUrl?: string,
+      analysis?: ImageProductAnalysis | null,
+    ): Promise<CatalogRow> => {
+      const priced = applyAiDraftToCatalogRow(
+        await buildRowWithLivePricing(item),
+        item,
+        analysis,
+      )
       let row = withUploadPreview(withRowMeta(priced, uploadId), previewUrl)
       const rowKey = row._rowId ?? getRowLabKey(row, 0)
       const uploadedUrl = getCachedUploadedUrl(uploadId)?.trim() ?? ''
@@ -1374,23 +1429,24 @@ function App() {
     async (uploadId: string, item: ParsedItem, previewUrl?: string) => {
       setLoadingLivePrices(true)
       try {
-        const row = await buildRowForUploadSelection(uploadId, item, previewUrl)
+        const analysis = uploadMatches.find((entry) => entry.id === uploadId)?.aiAnalysis
+        const row = await buildRowForUploadSelection(uploadId, item, previewUrl, analysis)
         setRows((prev) => [...prev, row])
         setUploadMatches((prev) =>
           prev.map((entry) =>
             entry.id === uploadId
               ? {
                   ...entry,
-                status: 'chosen',
-                selectedTitle: item.title,
-                selectedContentId: item.contentId,
-                uploadedMediaUrl: getCachedUploadedUrl(uploadId) ?? entry.uploadedMediaUrl,
-                colorHint:
-                  entry.colorHint ||
-                  buildColorHint(productColorById[item.contentId] ?? '', item.title),
-                candidates: entry.candidates.some(
-                  (candidate) => candidate.contentId === item.contentId,
-                )
+                  status: 'chosen',
+                  selectedTitle: item.title,
+                  selectedContentId: item.contentId,
+                  uploadedMediaUrl: getCachedUploadedUrl(uploadId) ?? entry.uploadedMediaUrl,
+                  colorHint:
+                    entry.colorHint ||
+                    buildColorHint(productColorById[item.contentId] ?? '', item.title),
+                  candidates: entry.candidates.some(
+                    (candidate) => candidate.contentId === item.contentId,
+                  )
                     ? entry.candidates
                     : [item, ...entry.candidates],
                 }
@@ -1401,7 +1457,7 @@ function App() {
         setLoadingLivePrices(false)
       }
     },
-    [buildRowForUploadSelection, getCachedUploadedUrl, productColorById],
+    [buildRowForUploadSelection, getCachedUploadedUrl, productColorById, uploadMatches],
   )
 
   const resetUploadSelection = useCallback((uploadId: string) => {
@@ -1430,6 +1486,7 @@ function App() {
         uploadId: card.id,
         previewUrl: card.previewUrl,
         item: card.candidates[0],
+        analysis: card.aiAnalysis,
       }))
 
     if (selections.length === 0) return
@@ -1439,8 +1496,8 @@ function App() {
       const newRows = await mapWithConcurrency(
         selections,
         MEDIA_UPLOAD_CONCURRENCY,
-        async ({ uploadId, item, previewUrl }) =>
-          buildRowForUploadSelection(uploadId, item, previewUrl),
+        async ({ uploadId, item, previewUrl, analysis }) =>
+          buildRowForUploadSelection(uploadId, item, previewUrl, analysis),
       )
       setRows((prev) => [...prev, ...newRows])
 
@@ -1567,9 +1624,7 @@ function App() {
                 file,
                 card: {
                   ...cardBase,
-                  status: 'auto-added' as const,
-                  selectedTitle: candidates[0].title,
-                  selectedContentId: candidates[0].contentId,
+                  status: 'needs-choice' as const,
                   candidates,
                 },
               }
@@ -1613,39 +1668,12 @@ function App() {
             return next
           })
 
-          const autoSelections = cards
-            .filter((entry) => entry.status === 'auto-added' && entry.candidates[0] != null)
-            .map((entry) => ({
-              uploadId: entry.id,
-              previewUrl: entry.previewUrl,
-              item: entry.candidates[0],
-            }))
-
-          if (autoSelections.length > 0) {
-            setLoadingLivePrices(true)
-            try {
-              const newRows = await mapWithConcurrency(
-                autoSelections,
-                MEDIA_UPLOAD_CONCURRENCY,
-                async ({ uploadId, item, previewUrl }) =>
-                  buildRowForUploadSelection(uploadId, item, previewUrl),
-              )
-              setRows((prev) => [...prev, ...newRows])
-            } finally {
-              setLoadingLivePrices(false)
-            }
-          }
-
-          const ambiguousEntries = entries.filter(
-            (entry) => entry.card.status === 'needs-choice' || entry.card.status === 'not-found',
-          )
-
-          if (ambiguousEntries.length > 0) {
+          if (entries.length > 0) {
             if (remainingAiBudget <= 0) {
               aiLimitHit = true
             } else {
-              const aiEntries = ambiguousEntries.slice(0, remainingAiBudget)
-              if (ambiguousEntries.length > aiEntries.length) {
+              const aiEntries = entries.slice(0, remainingAiBudget)
+              if (entries.length > aiEntries.length) {
                 aiLimitHit = true
               }
               remainingAiBudget -= aiEntries.length
@@ -1660,6 +1688,7 @@ function App() {
                   uploadId: string
                   item: ParsedItem
                   previewUrl: string
+                  analysis?: ImageProductAnalysis | null
                 }> = []
 
                 const results = await mapWithConcurrency(
@@ -1694,32 +1723,62 @@ function App() {
                       analysis,
                       colorMap,
                     )
-                    const merged =
+                    const mergedBase =
                       finalRanked.length > 0
                         ? finalRanked.map((candidate) => candidate.item)
                         : mergedCandidates
-                    return { entry, ocrQuery, analysis, merged, finalRanked, colorHint }
+                    const aiDecision =
+                      mergedBase.length > 1
+                        ? await chooseBestCatalogCandidateAi(
+                            entry.file,
+                            analysis,
+                            mergedBase,
+                            colorMap,
+                          ).catch(() => null)
+                        : null
+                    const merged = reorderCandidatesByDecision(mergedBase, aiDecision ?? undefined)
+                    return {
+                      entry,
+                      ocrQuery,
+                      analysis,
+                      merged,
+                      finalRanked,
+                      colorHint,
+                      aiDecision,
+                    }
                   },
                 )
 
                 for (const result of results) {
                   if (!result) continue
-                  const { entry, ocrQuery, analysis, merged, finalRanked, colorHint } = result
+                  const {
+                    entry,
+                    ocrQuery,
+                    analysis,
+                    merged,
+                    finalRanked,
+                    colorHint,
+                    aiDecision,
+                  } = result
                   const aiMatchNote = buildAiMatchNote({
                     aiAnalysis: analysis ?? undefined,
+                    aiDecision: aiDecision ?? undefined,
                     colorHint,
                   })
                   if (
                     merged[0] &&
-                    shouldAutoSelectCandidate(
-                      finalRanked,
-                      ocrQuery || entry.card.query,
-                      analysis,
-                    )
+                    ((aiDecision?.selectedContentId === merged[0].contentId &&
+                      aiDecision.confidence === 'high') ||
+                      shouldAutoSelectCandidate(
+                        finalRanked,
+                        ocrQuery || entry.card.query,
+                        analysis,
+                      ))
                   ) {
                     patchById.set(entry.card.id, {
                       ocrQuery,
                       aiAnalysis: analysis ?? undefined,
+                      aiDecision: aiDecision ?? undefined,
                       aiMatchNote,
                       colorHint,
                       candidates: merged,
@@ -1731,11 +1790,13 @@ function App() {
                       uploadId: entry.card.id,
                       item: merged[0],
                       previewUrl: entry.card.previewUrl,
+                      analysis,
                     })
                   } else if (merged.length > 1) {
                     patchById.set(entry.card.id, {
                       ocrQuery,
                       aiAnalysis: analysis ?? undefined,
+                      aiDecision: aiDecision ?? undefined,
                       aiMatchNote,
                       colorHint,
                       candidates: merged,
@@ -1745,6 +1806,7 @@ function App() {
                     patchById.set(entry.card.id, {
                       ocrQuery,
                       aiAnalysis: analysis ?? undefined,
+                      aiDecision: aiDecision ?? undefined,
                       aiMatchNote,
                       colorHint,
                       candidates: [],
@@ -1778,8 +1840,8 @@ function App() {
                     const rowsFromOcr = await mapWithConcurrency(
                       autoFromOcr,
                       MEDIA_UPLOAD_CONCURRENCY,
-                      async ({ uploadId, item, previewUrl }) =>
-                        buildRowForUploadSelection(uploadId, item, previewUrl),
+                      async ({ uploadId, item, previewUrl, analysis }) =>
+                        buildRowForUploadSelection(uploadId, item, previewUrl, analysis),
                     )
                     setRows((prev) => [...prev, ...rowsFromOcr])
                   } finally {
@@ -2480,7 +2542,6 @@ function App() {
     preparingExport ||
     catalogExportBlockedCount > 0
 
-  const showUploadStep = feedItems.length > 0 || Boolean(feedError)
   const showSelectionStep = selectedUploadCards.length > 0
   const showResolveStep = reviewUploadCards.length > 0 || unmatchedUploadCards.length > 0
   const showExportStep =
@@ -2517,518 +2578,1019 @@ function App() {
       <div className="shape shape-b" />
 
       <div className="assistant-app">
-        <section className={`assistant-stage ${assistantGoal ? 'is-active' : ''}`}>
-          <div className="assistant-shell">
-            <div className="assistant-stage-bar">
-              <div className="assistant-stage-mark" aria-hidden="true">
-                <span className="assistant-stage-mark-dot" />
-                <span className="assistant-stage-mark-text">MyShops</span>
-              </div>
-            </div>
-
-            <header className="assistant-header">
-              <p className="assistant-header-kicker">MyShops köməkçisi</p>
-              <h1>
-                {activeAssistantGoal?.label ?? 'Bu gün nə etmək istəyirsən?'}
-              </h1>
-              <p className="assistant-header-copy">
-                {activeAssistantGoal?.assistantReply ??
-                  'İstiqaməti seç, sonra addımları burada normal şəkildə davam etdirək.'}
+        <div className="workspace-app">
+          <header className="workspace-hero card">
+            <div className="workspace-hero-copy">
+              <p className="workspace-kicker">MyShops AI Catalog Studio</p>
+              <h1>Upload et, AI yoxlasın, Meta row hazır olsun.</h1>
+              <p className="workspace-lead">
+                Bu panel birbaşa iş üçündür: feed statusu, şəkil upload-u, AI qərarı,
+                review növbəsi və export eyni səthdə görünür.
               </p>
-            </header>
 
-            <div className="assistant-prompt-panel">
-              <div className={`assistant-composer ${assistantGoal ? 'is-filled' : ''}`}>
-                <div className="assistant-composer-leading">
-                  <span className="assistant-composer-mark" aria-hidden="true">
-                    <span className="assistant-composer-mark-dot" />
-                  </span>
-                  <div className="assistant-composer-copy">
-                    <span className="assistant-composer-label">Prompt</span>
-                    <strong>
-                      {activeAssistantGoal?.prompt ?? 'Bu gün nə etmək istəyirsən?'}
-                    </strong>
-                  </div>
-                </div>
-
-                {assistantGoal && (
-                  <button type="button" className="mini-btn" onClick={resetAssistantGoal}>
-                    Yeni axın
-                  </button>
-                )}
-              </div>
-
-              <div className="assistant-choice-grid">
+              <div className="workspace-goal-row">
                 {ASSISTANT_GOALS.map((goal) => {
                   const GoalIcon = goal.icon
-
                   return (
                     <button
                       key={goal.id}
                       type="button"
-                      className={`assistant-goal-choice ${assistantGoal === goal.id ? 'active' : ''}`}
+                      className={`workspace-goal-btn ${assistantGoal === goal.id ? 'active' : ''}`}
                       onClick={() => pickAssistantGoal(goal.id)}
                     >
-                      <span className="assistant-goal-choice-icon">
-                        <GoalIcon size={18} />
-                      </span>
-                      <span className="assistant-goal-choice-copy">
-                        <strong>{goal.label}</strong>
-                        <span>{goal.description}</span>
-                      </span>
-                      <ArrowRight size={16} className="assistant-goal-choice-arrow" />
+                      <GoalIcon size={16} />
+                      <span>{goal.label}</span>
+                      <ArrowRight size={15} />
                     </button>
                   )
                 })}
+                {assistantGoal && (
+                  <button
+                    type="button"
+                    className="workspace-goal-reset"
+                    onClick={resetAssistantGoal}
+                  >
+                    Rejimi sıfırla
+                  </button>
+                )}
               </div>
 
-              <p className="assistant-goal-note">{assistantGoalText}</p>
+              <div className="workspace-hero-note">
+                <strong>{activeAssistantGoal?.prompt ?? 'Hazırkı məqsəd seçilməyib.'}</strong>
+                <span>{assistantGoalText}</span>
+              </div>
             </div>
 
-            {assistantGoal && activeAssistantGoal && (
-              <div className="assistant-scene">
-                <div className="assistant-flow-summary">
-                  <p>{activeAssistantGoal.assistantReply}</p>
-                </div>
+            <div className="workspace-hero-aside">
+              <div className="workspace-stat-grid">
+                <article className="workspace-stat-card">
+                  <span>Feed məhsulu</span>
+                  <strong>{feedItems.length}</strong>
+                  <small>{feedItems.length > 0 ? 'Baza hazırdır' : 'Baza hələ yüklənməyib'}</small>
+                </article>
+                <article className="workspace-stat-card">
+                  <span>Hazır row</span>
+                  <strong>{rows.length}</strong>
+                  <small>Meta cədvəlində aktiv sətirlər</small>
+                </article>
+                <article className="workspace-stat-card">
+                  <span>AI analiz</span>
+                  <strong>{aiInsightStats.analyzed}</strong>
+                  <small>{aiInsightStats.highConfidence} yüksək etibarlı kart</small>
+                </article>
+                <article className="workspace-stat-card">
+                  <span>Review növbəsi</span>
+                  <strong>{reviewUploadCards.length + unmatchedUploadCards.length}</strong>
+                  <small>{uploadStats.chosen + uploadStats.autoAdded} kart artıq həll olunub</small>
+                </article>
+              </div>
 
-                <div className="assistant-main assistant-main-stack">
-                  <article className="assistant-step card reveal">
-                    <div className="assistant-step-head">
-                      <span className="assistant-step-index">01</span>
-                      <div>
-                        <p className="assistant-card-kicker">Hazırlıq</p>
-                        <h2>Məhsul bazasını hazır vəziyyətə gətir</h2>
-                        <p>
-                          {feedItems.length > 0
-                            ? `${feedItems.length} məhsul və rəng məlumatı artıq hazırdır.`
-                            : 'Seçimini aldım. İndi ilk olaraq məhsul bazasını və rəng xəritəsini hazırlayıram.'}{' '}
-                          {loadingFeed
-                            ? 'Hazırlıq gedir. Bitən kimi növbəti kart açılacaq.'
-                            : 'Bu mərhələ hazır olanda növbəti kart açılacaq.'}
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="assistant-step-actions">
-                      <button
-                        type="button"
-                        onClick={() => void loadFeed()}
-                        disabled={!assistantGoal || loadingFeed}
-                      >
-                        {loadingFeed
-                          ? 'Hazırlanır...'
-                          : feedItems.length > 0
-                            ? 'Bazanı yenilə'
-                            : 'Bazanı hazırla'}
-                      </button>
-                      <span className="assistant-inline-note">
-                        {feedItems.length > 0
-                          ? `${feedItems.length} məhsul artıq hazırdır.`
-                          : 'Seçim etdikdən sonra bu mərhələ avtomatik başlayır.'}
-                      </span>
-                    </div>
-                    {feedError && <p className="error">{feedError}</p>}
-                  </article>
-
-                  {assistantBusyLabel && (
-                    <article className="assistant-processing card reveal">
-                      <div className="processing-visual" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
-                      </div>
-                      <div>
-                        <p className="assistant-card-kicker">Arxa plan işi</p>
-                        <h2>{assistantBusyLabel}</h2>
-                        <p>
-                          Bu mərhələdə sadəcə gözlə. Uyğunlaşdırma, şəkil oxunuşu,
-                          qiymət yenilənməsi və digər texniki addımlar arxada gedir.
-                        </p>
-                      </div>
-                    </article>
-                  )}
-
-                  {showUploadStep && (
-                    <article className="assistant-step card reveal">
-                      <div className="assistant-step-head">
-                        <span className="assistant-step-index">02</span>
-                        <div>
-                          <p className="assistant-card-kicker">Yükləmə</p>
-                          <h2>Şəkilləri yüklə, mən uyğun məhsulları tapım</h2>
-                          <p>
-                            Şəkilləri bura yüklə. Fayl adları, süni intellekt oxunuşu və
-                            uyğunlaşdırma birlikdə işləyəcək, sən isə yalnız nəticəni
-                            görəcəksən.
-                          </p>
-                        </div>
-                      </div>
-                      <div className="assistant-step-actions">
-                        <input
-                          ref={guidedUploadInputRef}
-                          type="file"
-                          accept="image/*"
-                          multiple
-                          onChange={handleBatchImageUpload}
-                          className="assistant-hidden-input"
-                        />
-                        <button
-                          type="button"
-                          className="primary"
-                          onClick={openGuidedUploadPicker}
-                          disabled={!assistantGoal || loadingFeed || processingUploads}
-                        >
-                          {processingUploads ? 'Şəkillər işlənir...' : 'Şəkilləri seç və başla'}
-                        </button>
-                        <span className="assistant-inline-note">
-                          {uploadMatches.length > 0
-                            ? `${uploadMatches.length} fayl qəbul olunub.`
-                            : 'Hazır olduqda çoxlu şəkil seçə bilərsən.'}
-                        </span>
-                      </div>
-                      {uploadNotice && <p className="hint warning">{uploadNotice}</p>}
-                      {aiReadProgress && (
-                        <p className="assistant-inline-note">
-                          Süni intellekt oxunuşu: {aiReadProgress.done}/{aiReadProgress.total}
-                        </p>
-                      )}
-                    </article>
-                  )}
-
-                  {showSelectionStep && (
-                    <article className="assistant-step card reveal">
-                      <div className="assistant-step-head">
-                        <span className="assistant-step-index">03</span>
-                        <div>
-                          <p className="assistant-card-kicker">Hazır seçilənlər</p>
-                          <h2>Sistem bu məhsulları sənin üçün hazırlayıb</h2>
-                          <p>
-                            Nəsə uyğun gəlmirsə dəyişə bilərsən. Hər şey qaydasındadırsa,
-                            növbəti addım export olacaq.
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="assistant-selection-grid">
-                        {selectedUploadCards.slice(0, 8).map((card) => {
-                          const selectedColor = card.selectedContentId
-                            ? productColorById[card.selectedContentId]
-                            : ''
-
-                          return (
-                            <article className="assistant-selection-card" key={card.id}>
-                              <img src={card.previewUrl} alt={card.fileName} />
-                              <div>
-                                <strong>{card.selectedTitle ?? card.fileName}</strong>
-                                <p>
-                                  {card.status === 'auto-added'
-                                    ? 'Sistem avtomatik seçdi'
-                                    : 'Sən və ya sistem seçim etdi'}
-                                </p>
-                                {(selectedColor || card.colorHint) && (
-                                  <div className="assistant-color-row">
-                                    {selectedColor && (
-                                      <span className="assistant-color-badge">
-                                        Seçilən rəng: {selectedColor}
-                                      </span>
-                                    )}
-                                    {!selectedColor && card.colorHint && (
-                                      <span className="assistant-color-badge ghost">
-                                        Rəng ipucu: {card.colorHint}
-                                      </span>
-                                    )}
-                                  </div>
-                                )}
-                                <button
-                                  type="button"
-                                  className="mini-btn"
-                                  onClick={() => resetUploadSelection(card.id)}
-                                >
-                                  Dəyiş
-                                </button>
-                              </div>
-                            </article>
-                          )
-                        })}
-                      </div>
-                    </article>
-                  )}
-
-                  {showResolveStep && (
-                    <article className="assistant-step card reveal">
-                      <div className="assistant-step-head">
-                        <span className="assistant-step-index">04</span>
-                        <div>
-                          <p className="assistant-card-kicker">AI yoxlaması</p>
-                          <h2>AI analiz nəticələrini iki təmiz qrupda göstərirəm</h2>
-                          <p>
-                            AI uyğun tapdıqlarını ayrıca göstərirəm, saytda çıxmayanları da
-                            qarışdırmadan ayrıca siyahıya salıram.
-                          </p>
-                        </div>
-                      </div>
-
-                      {reviewUploadCards.length > 0 && (
-                        <div className="assistant-choice-group">
-                          <div className="assistant-choice-group-head">
-                            <strong>AI uyğun namizədlər tapdı</strong>
-                            <span>{reviewUploadCards.length} kart baxış gözləyir</span>
-                          </div>
-                          <div className="assistant-choice-list">
-                            {reviewUploadCards.slice(0, 6).map((card) => (
-                              <article className="assistant-choice-card" key={card.id}>
-                                <img
-                                  src={card.previewUrl}
-                                  alt={card.fileName}
-                                  className="assistant-choice-preview"
-                                />
-                                <div className="assistant-choice-body">
-                                  <strong>{card.fileName}</strong>
-                                  <p className="muted">
-                                    AI bu məhsul üçün daha uyğun variantları çıxardı. Sadəcə
-                                    doğru olanı seç.
-                                  </p>
-                                  <p className="assistant-analysis-note">
-                                    {card.aiMatchNote ?? buildAiMatchNote(card)}
-                                  </p>
-                                  <div className="assistant-analysis-chips">
-                                    {buildAiAnalysisChips(card.aiAnalysis).map((chip) => (
-                                      <span key={chip} className="assistant-analysis-chip">
-                                        {chip}
-                                      </span>
-                                    ))}
-                                    {card.colorHint && (
-                                      <span className="assistant-color-badge ghost">
-                                        Rəng ipucu: {card.colorHint}
-                                      </span>
-                                    )}
-                                  </div>
-
-                                  <div className="assistant-candidate-list">
-                                    {card.candidates.slice(0, 3).map((candidate) => {
-                                      const color = productColorById[candidate.contentId]
-
-                                      return (
-                                        <button
-                                          type="button"
-                                          key={candidate.contentId}
-                                          className="assistant-candidate-chip"
-                                          onClick={() =>
-                                            void selectUploadCandidate(
-                                              card.id,
-                                              candidate,
-                                              card.previewUrl,
-                                            )
-                                          }
-                                          disabled={loadingLivePrices}
-                                        >
-                                          <strong>{candidate.title}</strong>
-                                          <span>{candidate.price}</span>
-                                          {color && (
-                                            <small className="assistant-candidate-meta">
-                                              Rəng: {color}
-                                            </small>
-                                          )}
-                                        </button>
-                                      )
-                                    })}
-                                  </div>
-
-                                  <div className="assistant-manual-search">
-                                    <input
-                                      type="search"
-                                      value={manualSearchDrafts[card.id] ?? ''}
-                                      placeholder="AI tapmasa, məhsul adını yaz"
-                                      onChange={(e) =>
-                                        updateUploadSearchDraft(card.id, e.target.value)
-                                      }
-                                      onKeyDown={(e) => {
-                                        if (e.key === 'Enter') {
-                                          e.preventDefault()
-                                          void searchUploadCardByDraft(card.id)
-                                        }
-                                      }}
-                                    />
-                                    <button
-                                      type="button"
-                                      onClick={() => void searchUploadCardByDraft(card.id)}
-                                      disabled={loadingFeed}
-                                    >
-                                      Axtar
-                                    </button>
-                                  </div>
-                                </div>
-                              </article>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      {unmatchedUploadCards.length > 0 && (
-                        <div className="assistant-choice-group unmatched">
-                          <div className="assistant-choice-group-head">
-                            <strong>Saytda çıxmayanlar</strong>
-                            <span>{unmatchedUploadCards.length} kart ayrıca qruplaşdırıldı</span>
-                          </div>
-                          <div className="assistant-choice-list">
-                            {unmatchedUploadCards.slice(0, 6).map((card) => (
-                              <article
-                                className="assistant-choice-card assistant-choice-card-unmatched"
-                                key={card.id}
-                              >
-                                <img
-                                  src={card.previewUrl}
-                                  alt={card.fileName}
-                                  className="assistant-choice-preview"
-                                />
-                                <div className="assistant-choice-body">
-                                  <strong>{card.fileName}</strong>
-                                  <p className="muted">
-                                    AI şəkli analiz etdi, amma feed-də etibarlı uyğun məhsul
-                                    tapmadı. Ona görə bu kartı ayrıca saxladım.
-                                  </p>
-                                  <p className="assistant-analysis-note">
-                                    {card.aiMatchNote ?? buildAiMatchNote(card)}
-                                  </p>
-                                  <div className="assistant-analysis-chips">
-                                    {buildAiAnalysisChips(card.aiAnalysis).map((chip) => (
-                                      <span key={chip} className="assistant-analysis-chip">
-                                        {chip}
-                                      </span>
-                                    ))}
-                                  </div>
-
-                                  <div className="assistant-manual-search">
-                                    <input
-                                      type="search"
-                                      value={manualSearchDrafts[card.id] ?? ''}
-                                      placeholder="Əl ilə məhsul adı yaz və axtar"
-                                      onChange={(e) =>
-                                        updateUploadSearchDraft(card.id, e.target.value)
-                                      }
-                                      onKeyDown={(e) => {
-                                        if (e.key === 'Enter') {
-                                          e.preventDefault()
-                                          void searchUploadCardByDraft(card.id)
-                                        }
-                                      }}
-                                    />
-                                    <button
-                                      type="button"
-                                      onClick={() => void searchUploadCardByDraft(card.id)}
-                                      disabled={loadingFeed}
-                                    >
-                                      Axtar
-                                    </button>
-                                  </div>
-                                </div>
-                              </article>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      {reviewUploadCards.length + unmatchedUploadCards.length > 6 && (
-                        <p className="assistant-inline-note">
-                          Daha çox kart var, amma sistem onları artıq ayrıca qruplara ayırıb.
-                        </p>
-                      )}
-                    </article>
-                  )}
-
-                  {showExportStep && (
-                    <article className="assistant-step assistant-export card reveal">
-                      <div className="assistant-step-head">
-                        <span className="assistant-step-index">05</span>
-                        <div>
-                          <p className="assistant-card-kicker">Final</p>
-                          <h2>Export faylını hazırla və endir</h2>
-                          <p>
-                            Hazır olanları dərhal götürəcəyəm, çatışmayan şəkilləri isə
-                            {catalogMediaProvider === 'drive'
-                              ? ' Google Drive üzərindən export zamanı tamamlayacağam.'
-                              : ' mümkündürsə export zamanı tamamlayacağam.'}
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="assistant-export-panel">
-                        <div className="assistant-export-metrics">
-                          <div>
-                            <strong>{rows.length}</strong>
-                            <span>hazır sətir</span>
-                          </div>
-                          <div>
-                            <strong>
-                              {catalogExportBlockedCount > 0
-                                ? catalogExportBlockedCount
-                                : catalogExportDeferredCount > 0
-                                  ? catalogExportDeferredCount
-                                  : catalogExportReadyCount}
-                            </strong>
-                            <span>
-                              {catalogExportBlockedCount > 0
-                                ? 'düzəliş lazımdır'
-                                : catalogExportDeferredCount > 0
-                                  ? 'exportda tamamlanacaq'
-                                  : 'tam hazır'}
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="assistant-export-actions">
-                          <button
-                            type="button"
-                            className="primary"
-                            onClick={exportCsv}
-                            disabled={exportDisabled}
-                          >
-                            {exportPrimaryLabel}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={refreshAllRowLivePrices}
-                            disabled={rows.length === 0 || loadingLivePrices}
-                          >
-                            Qiymətləri yenilə
-                          </button>
-                        </div>
-                      </div>
-
-                      <div
-                        ref={tableStatusRef}
-                        className="assistant-export-status"
-                        aria-live="polite"
-                      >
-                        {tableNotice && (
-                          <p className="ok">
-                            {tableNotice} Endirmə başlamasa, düyməni yenidən klikləyə
-                            bilərsən.
-                          </p>
-                        )}
-                        {tableError && <p className="error">{tableError}</p>}
-                        {!tableError && !tableNotice && (
-                          <p className="assistant-inline-note">
-                            {rows.length === 0
-                              ? 'Hələ export üçün məhsul yoxdur.'
-                              : catalogExportBlockedCount > 0
-                                ? 'Bəzi sətirlərdə public şəkil yoxdur. Əvvəlcə onları düzəltmək lazımdır.'
-                                : catalogExportDeferredCount > 0 &&
-                                    catalogMediaProvider === 'drive' &&
-                                    !driveConnected
-                                  ? 'İlk klikdə Google icazəsi soruşulacaq, sonra şəkillər tamamlanacaq.'
-                                : catalogExportDeferredCount > 0
-                                  ? `${catalogExportDeferredCount} sətirdə şəkil export zamanı avtomatik hazırlanacaq.`
-                                : 'Hər şey hazırdır. İndi endirə bilərsən.'}
-                          </p>
-                        )}
-                      </div>
-                    </article>
-                  )}
+              <div className="workspace-engine-card">
+                <p className="workspace-kicker subtle">AI mühərriki</p>
+                <h2>{configuredAiPrimaryLabel}</h2>
+                <p>
+                  Prioritet model budur. Sistem əvvəl şəkli dərin analiz edir, sonra
+                  top feed namizədləri arasında ayrıca AI qərarı verir.
+                </p>
+                <div className="workspace-engine-pills">
+                  <span>{aiInsightStats.decided} AI qərarı</span>
+                  <span>{aiInsightStats.metaDrafts} Meta draft</span>
+                  <span>{catalogMediaProvider === 'drive' ? 'Drive export' : 'Public URL export'}</span>
                 </div>
               </div>
+            </div>
+          </header>
+
+          {assistantBusyLabel && (
+            <section className="workspace-busy card">
+              <div className="workspace-busy-pulse" aria-hidden="true">
+                <span />
+                <span />
+                <span />
+              </div>
+              <div>
+                <p className="workspace-kicker subtle">Arxa plan işi</p>
+                <h2>{assistantBusyLabel}</h2>
+                <p>
+                  Şəkil analizi, namizəd seçimi, qiymət yenilənməsi və export üçün
+                  media hazırlığı arxada davam edir.
+                </p>
+              </div>
+            </section>
+          )}
+
+          <section className="workspace-grid">
+            <article className="workspace-card card">
+              <div className="workspace-card-head">
+                <div>
+                  <p className="workspace-kicker subtle">01. Baza</p>
+                  <h2>Feed və rəng xəritəsini hazırla</h2>
+                </div>
+              </div>
+              <p className="workspace-card-copy">
+                Uyğunlaşdırma keyfiyyəti feed və rəng datasından asılıdır. Bu addımda
+                məhsullar və rəng ipucları lokala çəkilir.
+              </p>
+              <div className="workspace-actions">
+                <button type="button" onClick={() => void loadFeed()} disabled={loadingFeed}>
+                  {loadingFeed
+                    ? 'Baza hazırlanır...'
+                    : feedItems.length > 0
+                      ? 'Bazanı yenilə'
+                      : 'Bazanı yüklə'}
+                </button>
+                <span className="workspace-inline-note">
+                  {feedItems.length > 0
+                    ? `${feedItems.length} məhsul və rəng ipucu hazırdır.`
+                    : 'İlk dəfə yükledikdən sonra AI matching daha dəqiq işləyəcək.'}
+                </span>
+              </div>
+              {feedError && <p className="error">{feedError}</p>}
+            </article>
+
+            <article className="workspace-card card">
+              <div className="workspace-card-head">
+                <div>
+                  <p className="workspace-kicker subtle">02. Batch upload</p>
+                  <h2>Şəkilləri yüklə və AI pipeline-i işə sal</h2>
+                </div>
+              </div>
+              <p className="workspace-card-copy">
+                İndi hər şəkil əvvəl AI analizindən keçir. Fayl adı sadəcə yardımçı siqnaldır;
+                yekun uyğunlaşdırma vizual analiz və namizəd qərarı ilə verilir.
+              </p>
+              <div className="workspace-actions">
+                <input
+                  ref={guidedUploadInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={handleBatchImageUpload}
+                  className="assistant-hidden-input"
+                />
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={openGuidedUploadPicker}
+                  disabled={loadingFeed || processingUploads}
+                >
+                  {processingUploads ? 'AI pipeline işləyir...' : 'Şəkilləri seç'}
+                </button>
+                <button
+                  type="button"
+                  onClick={clearUploadMatches}
+                  disabled={uploadMatches.length === 0}
+                >
+                  Siyahını təmizlə
+                </button>
+                <button
+                  type="button"
+                  onClick={bulkSelectTopCandidates}
+                  disabled={uploadStats.needsChoice === 0 || loadingLivePrices}
+                >
+                  Top seçimi tətbiq et
+                </button>
+              </div>
+              <div className="workspace-upload-stats">
+                <span className="stat-pill ok">Auto: {uploadStats.autoAdded}</span>
+                <span className="stat-pill info">Review: {uploadStats.needsChoice}</span>
+                <span className="stat-pill done">Seçilib: {uploadStats.chosen}</span>
+                <span className="stat-pill warn">Tapılmayıb: {uploadStats.notFound}</span>
+              </div>
+              {uploadNotice && <p className="hint warning">{uploadNotice}</p>}
+              {aiReadProgress && aiReadProgress.total > 0 && (
+                <p className="workspace-inline-note">
+                  AI pipeline: {aiReadProgress.done}/{aiReadProgress.total}
+                </p>
+              )}
+            </article>
+
+            <article className="workspace-card card">
+              <div className="workspace-card-head">
+                <div>
+                  <p className="workspace-kicker subtle">03. Manual axtarış</p>
+                  <h2>Feed içində əl ilə məhsul tap</h2>
+                </div>
+              </div>
+              <div className="workspace-search-row">
+                <input
+                  type="search"
+                  placeholder="Məs: iPhone 16 Pro 256GB Black"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+                <span className="workspace-inline-note">
+                  {searchQuery.trim() ? `${matches.length} uyğun nəticə` : 'Sorğu yaz'}
+                </span>
+              </div>
+              {matches.length > 0 && (
+                <div className="workspace-match-list">
+                  {matches.slice(0, 5).map((item) => (
+                    <article key={`${item.contentId}-${item.title}`} className="workspace-match-item">
+                      <strong>{item.title}</strong>
+                      <span>{item.price}</span>
+                    </article>
+                  ))}
+                </div>
+              )}
+              <div className="workspace-actions">
+                <button
+                  type="button"
+                  onClick={addMatchesToTable}
+                  disabled={matches.length === 0 || loadingLivePrices}
+                >
+                  {loadingLivePrices
+                    ? 'Qiymətlər yenilənir...'
+                    : `Tapılanları cədvələ əlavə et (${matches.length})`}
+                </button>
+              </div>
+            </article>
+
+            <article className="workspace-card card">
+              <div className="workspace-card-head">
+                <div>
+                  <p className="workspace-kicker subtle">04. AI nəticəsi</p>
+                  <h2>AI bu batch-də nə etdi</h2>
+                </div>
+              </div>
+              <div className="workspace-feature-list">
+                <div>
+                  <strong>Detallı vizual profil</strong>
+                  <span>Brend, seriya, model, storage, rəng, görünən mətn və paket ipucu çıxarılır.</span>
+                </div>
+                <div>
+                  <strong>AI namizəd qərarı</strong>
+                  <span>Top feed namizədləri arasında ayrıca qərar verilir və ən uyğun SKU önə keçirilir.</span>
+                </div>
+                <div>
+                  <strong>Meta draft</strong>
+                  <span>Uyğun olan kartlarda Meta üçün title/description draft-ları yaradılır.</span>
+                </div>
+              </div>
+            </article>
+          </section>
+
+          {showSelectionStep && (
+            <section className="workspace-board card">
+              <div className="workspace-board-head">
+                <div>
+                  <p className="workspace-kicker subtle">Hazır seçilənlər</p>
+                  <h2>AI və ya sənin təsdiqinlə seçilmiş məhsullar</h2>
+                </div>
+                <span>{selectedUploadCards.length} kart hazırdır</span>
+              </div>
+
+              <div className="workspace-selected-grid">
+                {selectedUploadCards.slice(0, 8).map((card) => {
+                  const selectedColor = card.selectedContentId
+                    ? productColorById[card.selectedContentId]
+                    : ''
+
+                  return (
+                    <article className="workspace-selected-card" key={card.id}>
+                      <img src={card.previewUrl} alt={card.fileName} />
+                      <div>
+                        <strong>{card.selectedTitle ?? card.fileName}</strong>
+                        <p>{card.aiMatchNote ?? buildAiMatchNote(card)}</p>
+                        {(selectedColor || card.colorHint) && (
+                          <div className="workspace-chip-row">
+                            {selectedColor && <span className="workspace-chip">Rəng: {selectedColor}</span>}
+                            {!selectedColor && card.colorHint && (
+                              <span className="workspace-chip ghost">İpucu: {card.colorHint}</span>
+                            )}
+                          </div>
+                        )}
+                        {buildAiMetaPreview(card.aiAnalysis) && (
+                          <small>{buildAiMetaPreview(card.aiAnalysis)}</small>
+                        )}
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => resetUploadSelection(card.id)}
+                        >
+                          Seçimi dəyiş
+                        </button>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+            </section>
+          )}
+
+          {showResolveStep && (
+            <section className="workspace-board workspace-review-board card">
+              <div className="workspace-board-head">
+                <div>
+                  <p className="workspace-kicker subtle">AI review board</p>
+                  <h2>Şübhəli kartları sürətli şəkildə həll et</h2>
+                </div>
+                <span>{reviewUploadCards.length + unmatchedUploadCards.length} kart gözləyir</span>
+              </div>
+              <p className="workspace-board-copy">
+                Sol tərəfdə AI-nin namizəd tapdığı kartlar, sağ tərəfdə isə feed-də
+                etibarlı SKU tapılmayanlar var. Hər sütun ayrıca scroll olur ki ekran boş görünməsin.
+              </p>
+
+              <div className="workspace-review-grid">
+                <div className="workspace-review-column">
+                  <div className="workspace-column-head">
+                    <strong>Namizəd tapılanlar</strong>
+                    <span>{reviewUploadCards.length}</span>
+                  </div>
+
+                  <div className="workspace-review-list">
+                    {reviewUploadCards.length === 0 && (
+                      <p className="workspace-inline-note">
+                        Hazırda review gözləyən AI namizədi yoxdur.
+                      </p>
+                    )}
+
+                    {reviewUploadCards.slice(0, 12).map((card) => (
+                      <article className="vision-card" key={card.id}>
+                        <div className="vision-card-media">
+                          <img src={card.previewUrl} alt={card.fileName} />
+                          <span className="vision-badge">
+                            {card.aiDecision?.selectedContentId
+                              ? `AI pick • ${describeConfidence(card.aiDecision.confidence)}`
+                              : 'Review lazımdır'}
+                          </span>
+                        </div>
+                        <div className="vision-card-body">
+                          <div className="vision-card-head">
+                            <strong>{card.fileName}</strong>
+                            <span>{card.aiMatchNote ?? buildAiMatchNote(card)}</span>
+                          </div>
+
+                          <div className="workspace-chip-row">
+                            {buildAiAnalysisChips(card.aiAnalysis).slice(0, 4).map((chip) => (
+                              <span key={chip} className="workspace-chip">
+                                {chip}
+                              </span>
+                            ))}
+                            {card.colorHint && (
+                              <span className="workspace-chip ghost">İpucu: {card.colorHint}</span>
+                            )}
+                          </div>
+
+                          {card.aiAnalysis?.matchSignals.length ? (
+                            <div className="vision-signals">
+                              {card.aiAnalysis.matchSignals.slice(0, 3).map((signal) => (
+                                <span key={signal}>{signal}</span>
+                              ))}
+                            </div>
+                          ) : null}
+
+                          {buildAiMetaPreview(card.aiAnalysis) && (
+                            <div className="vision-meta-draft">
+                              {card.aiAnalysis?.metaTitle && (
+                                <strong>{card.aiAnalysis.metaTitle}</strong>
+                              )}
+                              <p>{buildAiMetaPreview(card.aiAnalysis)}</p>
+                            </div>
+                          )}
+
+                          {card.candidates.length > 4 && (
+                            <div className="workspace-inline-actions">
+                              <button
+                                type="button"
+                                className="mini-btn"
+                                onClick={() => toggleCandidateExpand(card.id)}
+                              >
+                                {expandedCandidates[card.id]
+                                  ? 'Yığ'
+                                  : `Daha çox (${card.candidates.length - 4})`}
+                              </button>
+                            </div>
+                          )}
+
+                          <div className="vision-candidate-list">
+                            {(expandedCandidates[card.id]
+                              ? card.candidates
+                              : card.candidates.slice(0, 4)
+                            ).map((candidate) => {
+                              const color = productColorById[candidate.contentId]
+                              const aiPicked =
+                                card.aiDecision?.selectedContentId === candidate.contentId
+                              return (
+                                <button
+                                  type="button"
+                                  key={candidate.contentId}
+                                  className={`vision-candidate-btn ${aiPicked ? 'is-ai-picked' : ''}`}
+                                  onClick={() =>
+                                    void selectUploadCandidate(card.id, candidate, card.previewUrl)
+                                  }
+                                  disabled={loadingLivePrices}
+                                >
+                                  <strong>{candidate.title}</strong>
+                                  <span>
+                                    {candidate.price}
+                                    {candidate.brand ? ` • ${candidate.brand}` : ''}
+                                    {color ? ` • Rəng: ${color}` : ''}
+                                  </span>
+                                  {aiPicked && <small>AI bunu önə çəkib</small>}
+                                </button>
+                              )
+                            })}
+                          </div>
+
+                          <div className="workspace-manual-search">
+                            <input
+                              type="search"
+                              value={manualSearchDrafts[card.id] ?? ''}
+                              placeholder="Əl ilə məhsul adını yaz"
+                              onChange={(e) => updateUploadSearchDraft(card.id, e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault()
+                                  void searchUploadCardByDraft(card.id)
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => void searchUploadCardByDraft(card.id)}
+                              disabled={loadingFeed}
+                            >
+                              Axtar
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="workspace-review-column">
+                  <div className="workspace-column-head">
+                    <strong>Feed-də tapılmayanlar</strong>
+                    <span>{unmatchedUploadCards.length}</span>
+                  </div>
+
+                  <div className="workspace-review-list">
+                    {unmatchedUploadCards.length === 0 && (
+                      <p className="workspace-inline-note">
+                        Hazırda ayrıca həll tələb edən tapılmayan kart yoxdur.
+                      </p>
+                    )}
+
+                    {unmatchedUploadCards.slice(0, 12).map((card) => (
+                      <article className="vision-card unmatched" key={card.id}>
+                        <div className="vision-card-media">
+                          <img src={card.previewUrl} alt={card.fileName} />
+                          <span className="vision-badge muted">Etibarlı SKU tapılmadı</span>
+                        </div>
+                        <div className="vision-card-body">
+                          <div className="vision-card-head">
+                            <strong>{card.fileName}</strong>
+                            <span>{card.aiMatchNote ?? buildAiMatchNote(card)}</span>
+                          </div>
+
+                          <div className="workspace-chip-row">
+                            {buildAiAnalysisChips(card.aiAnalysis).slice(0, 4).map((chip) => (
+                              <span key={chip} className="workspace-chip">
+                                {chip}
+                              </span>
+                            ))}
+                          </div>
+
+                          {buildAiMetaPreview(card.aiAnalysis) && (
+                            <div className="vision-meta-draft">
+                              {card.aiAnalysis?.metaTitle && (
+                                <strong>{card.aiAnalysis.metaTitle}</strong>
+                              )}
+                              <p>{buildAiMetaPreview(card.aiAnalysis)}</p>
+                            </div>
+                          )}
+
+                          <div className="workspace-manual-search">
+                            <input
+                              type="search"
+                              value={manualSearchDrafts[card.id] ?? ''}
+                              placeholder="Əl ilə məhsul adı yaz və axtar"
+                              onChange={(e) => updateUploadSearchDraft(card.id, e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault()
+                                  void searchUploadCardByDraft(card.id)
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => void searchUploadCardByDraft(card.id)}
+                              disabled={loadingFeed}
+                            >
+                              Axtar
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {showExportStep && (
+            <section className="workspace-board card">
+              <div className="workspace-board-head">
+                <div>
+                  <p className="workspace-kicker subtle">Export mərkəzi</p>
+                  <h2>Meta üçün yekun CSV-ni hazırla</h2>
+                </div>
+                <span>{catalogMediaProvider === 'drive' ? 'Drive əsaslı export' : 'Public URL export'}</span>
+              </div>
+
+              <div className="workspace-export-grid">
+                <div className="workspace-export-metric">
+                  <strong>{rows.length}</strong>
+                  <span>hazır row</span>
+                </div>
+                <div className="workspace-export-metric">
+                  <strong>{catalogExportReadyCount}</strong>
+                  <span>tam hazır</span>
+                </div>
+                <div className="workspace-export-metric">
+                  <strong>{catalogExportDeferredCount}</strong>
+                  <span>export zamanı tamamlanacaq</span>
+                </div>
+                <div className="workspace-export-metric">
+                  <strong>{catalogExportBlockedCount}</strong>
+                  <span>əl ilə düzəliş istəyir</span>
+                </div>
+              </div>
+
+              <div className="workspace-actions">
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={exportCsv}
+                  disabled={exportDisabled}
+                >
+                  {exportPrimaryLabel}
+                </button>
+                <button
+                  type="button"
+                  onClick={refreshAllRowLivePrices}
+                  disabled={rows.length === 0 || loadingLivePrices}
+                >
+                  Qiymətləri yenilə
+                </button>
+              </div>
+
+              <div ref={tableStatusRef} className="workspace-status-panel" aria-live="polite">
+                {tableNotice && <p className="ok">{tableNotice}</p>}
+                {tableError && <p className="error">{tableError}</p>}
+                {!tableError && !tableNotice && (
+                  <p className="workspace-inline-note">
+                    {rows.length === 0
+                      ? 'Hələ export üçün məhsul yoxdur.'
+                      : catalogExportBlockedCount > 0
+                        ? 'Bəzi sətirlərdə public image yoxdur. Əvvəlcə onları düzəltmək lazımdır.'
+                        : catalogExportDeferredCount > 0 &&
+                            catalogMediaProvider === 'drive' &&
+                            !driveConnected
+                          ? 'İlk klikdə Google icazəsi soruşula bilər, sonra şəkillər tamamlanacaq.'
+                          : catalogExportDeferredCount > 0
+                            ? `${catalogExportDeferredCount} sətirdə media export zamanı tamamlanacaq.`
+                            : 'Hər şey hazırdır. CSV-ni indi endirə bilərsən.'}
+                  </p>
+                )}
+              </div>
+            </section>
+          )}
+
+          <section className="workspace-board card">
+            <div className="workspace-board-head">
+              <div>
+                <p className="workspace-kicker subtle">Kataloq cədvəli</p>
+                <h2>Meta row-larını son dəfə yoxla</h2>
+              </div>
+              <span>{rows.length} sətir</span>
+            </div>
+
+            <div className="row-actions">
+              <button type="button" onClick={addEmptyRow}>
+                Boş sətir əlavə et
+              </button>
+              <button
+                type="button"
+                onClick={refreshAllRowLivePrices}
+                disabled={rows.length === 0 || loadingLivePrices}
+              >
+                {loadingLivePrices ? 'Qiymətlər yenilənir...' : 'Qiymətləri yenilə'}
+              </button>
+              <button type="button" onClick={exportCsv} disabled={rows.length === 0} className="primary">
+                Meta CSV yüklə
+              </button>
+            </div>
+
+            <div className="media-provider-panel">
+              <div className="media-provider-copy">
+                <strong>Avtomatik əsas şəkil mənbəyi</strong>
+                <p>
+                  Yeni seçilən məhsullarda `Gorseller ve videolar` sahəsi bu mənbəyə
+                  görə önə çəkilir.
+                </p>
+              </div>
+              <div className="media-provider-switch">
+                {CATALOG_MEDIA_PROVIDERS.map((provider) => (
+                  <button
+                    key={provider.id}
+                    type="button"
+                    className={`provider-chip ${
+                      catalogMediaProvider === provider.id ? 'active' : ''
+                    }`}
+                    onClick={() => {
+                      setCatalogMediaProvider(provider.id)
+                      setTableError(null)
+                    }}
+                  >
+                    <span>{provider.label}</span>
+                    <small>{provider.description}</small>
+                  </button>
+                ))}
+              </div>
+              <div className="row-actions media-provider-actions">
+                <button type="button" onClick={syncCatalogMediaToTable} disabled={rows.length === 0}>
+                  Seçiləni `Gorseller ve videolar` sahəsinə uygula
+                </button>
+              </div>
+            </div>
+
+            <p className={`hint ${catalogExportReadyCount < rows.length ? 'warning' : ''}`}>
+              Export hazırdır: <strong>{catalogExportReadyCount}</strong> row tam hazırdır,
+              <strong> {catalogExportDeferredCount}</strong> row export zamanı tamamlanacaq,
+              <strong> {catalogExportBlockedCount}</strong> row isə əl ilə düzəliş istəyir.
+            </p>
+
+            <div className="table-wrap">
+              <table className="catalog-table">
+                <thead>
+                  <tr>
+                    <th className="col-del">Sil</th>
+                    {HEADERS.map((header) => (
+                      <th key={header.key} className={header.wide ? 'col-wide' : ''}>
+                        {header.label}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.length === 0 ? (
+                    <tr>
+                      <td colSpan={HEADERS.length + 1} className="empty-cell">
+                        Hələ sətir yoxdur. AI seçimi və ya manual axtarışla row əlavə et.
+                      </td>
+                    </tr>
+                  ) : (
+                    rows.map((row, rowIndex) => {
+                      const media = normalizeMedia(row.imagesAndVideos)
+                      const imageUrls = media.filter((value) => !VIDEO_EXT.test(value))
+                      const videoUrls = media.filter((value) => VIDEO_EXT.test(value))
+                      const localPreviewUrl = row._localPreviewUrl?.trim() ?? ''
+
+                      return (
+                        <tr key={row._rowId ?? `${row.contentId}-${rowIndex}`}>
+                          <td className="col-del">
+                            <button
+                              type="button"
+                              className="btn-icon"
+                              onClick={() => removeRow(rowIndex)}
+                              title="Sil"
+                            >
+                              x
+                            </button>
+                          </td>
+
+                          {HEADERS.map((header) => (
+                            <td key={header.key} className={header.wide ? 'col-wide' : ''}>
+                              {header.key === 'imagesAndVideos' ? (
+                                <div className="media-cell">
+                                  <textarea
+                                    value={row[header.key]}
+                                    onChange={(e) =>
+                                      updateCell(rowIndex, header.key, e.target.value)
+                                    }
+                                    rows={4}
+                                    placeholder="Media URL-ləri buraya yaz"
+                                  />
+
+                                  <div className="media-tools">
+                                    <input
+                                      type="url"
+                                      value={mediaDrafts[rowIndex] ?? ''}
+                                      placeholder="Media URL əlavə et"
+                                      onChange={(e) => updateMediaDraft(rowIndex, e.target.value)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          e.preventDefault()
+                                          appendMediaUrl(rowIndex)
+                                        }
+                                      }}
+                                    />
+                                    <button
+                                      type="button"
+                                      className="mini-btn"
+                                      onClick={() => appendMediaUrl(rowIndex)}
+                                    >
+                                      Əlavə et
+                                    </button>
+                                  </div>
+
+                                  <div className="media-preview">
+                                    {imageUrls.slice(0, 3).map((url) => (
+                                      <a
+                                        key={url}
+                                        href={url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="thumb-link"
+                                        title={url}
+                                      >
+                                        <img src={url} alt="preview" loading="lazy" />
+                                      </a>
+                                    ))}
+                                    {videoUrls.slice(0, 2).map((url) => (
+                                      <a
+                                        key={url}
+                                        href={url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="video-chip"
+                                        title={url}
+                                      >
+                                        video
+                                      </a>
+                                    ))}
+                                    {imageUrls.length === 0 && localPreviewUrl && (
+                                      <>
+                                        <span className="thumb-link" title="Local preview">
+                                          <img src={localPreviewUrl} alt="local preview" loading="lazy" />
+                                        </span>
+                                        <span className="muted">Local preview</span>
+                                      </>
+                                    )}
+                                    {media.length === 0 && !localPreviewUrl && (
+                                      <span className="muted">Media yoxdur</span>
+                                    )}
+                                  </div>
+                                </div>
+                              ) : header.key === 'description' ? (
+                                <textarea
+                                  value={row[header.key]}
+                                  onChange={(e) => updateCell(rowIndex, header.key, e.target.value)}
+                                  rows={3}
+                                />
+                              ) : (
+                                <input
+                                  type="text"
+                                  value={row[header.key]}
+                                  onChange={(e) => updateCell(rowIndex, header.key, e.target.value)}
+                                />
+                              )}
+                            </td>
+                          ))}
+                        </tr>
+                      )
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <details className="workspace-advanced card">
+            <summary>
+              <div>
+                <p className="workspace-kicker subtle">Advanced media lab</p>
+                <strong>Alternativ media strategiyalarını test et</strong>
+              </div>
+              <span>{mediaLabReadyCounts[mediaLabMode]} row hazırdır</span>
+            </summary>
+
+            <div className="lab-mode-grid">
+              {MEDIA_LAB_MODES.map((mode) => {
+                const result = mediaLabResults[mode.id]
+                return (
+                  <button
+                    type="button"
+                    key={mode.id}
+                    className={`lab-mode-card ${mediaLabMode === mode.id ? 'active' : ''}`}
+                    onClick={() => {
+                      setMediaLabMode(mode.id)
+                      setMediaLabError(null)
+                      setMediaLabNotice(null)
+                    }}
+                  >
+                    <div>
+                      <strong>{mode.label}</strong>
+                      <p>{mode.description}</p>
+                    </div>
+                    <div className="lab-mode-meta">
+                      <span>{mediaLabReadyCounts[mode.id]} setir hazır</span>
+                      {result && (
+                        <span className={`lab-result ${result}`}>
+                          {result === 'works' ? 'İşlədi' : 'İşləmədi'}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="row-actions lab-actions">
+              <button type="button" onClick={exportMediaLabCsv} disabled={rows.length === 0}>
+                Test CSV export et
+              </button>
+              <button
+                type="button"
+                onClick={applyMediaLabModeToRows}
+                disabled={rows.length === 0 || mediaLabMode === 'current'}
+              >
+                İşləyən variantı əsas cədvələ köçür
+              </button>
+              <button type="button" className="ghost-success" onClick={() => markMediaLabResult(mediaLabMode, 'works')}>
+                İşlədi kimi qeyd et
+              </button>
+              <button type="button" className="ghost-warn" onClick={() => markMediaLabResult(mediaLabMode, 'fails')}>
+                İşləmədi kimi qeyd et
+              </button>
+              {mediaLabMode === 'google-drive' && (
+                <>
+                  <button type="button" onClick={() => void connectGoogleDrive()} disabled={driveBusy}>
+                    {driveConnected ? 'Drive-i yenidən bağla' : 'Google Drive-a bağlan'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void uploadRowsToGoogleDrive()}
+                    disabled={driveBusy || rows.length === 0}
+                  >
+                    {driveBusy ? 'Drive upload...' : 'Local şəkilləri Drive-a yüklə'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-neutral"
+                    onClick={disconnectGoogleDrive}
+                    disabled={driveBusy || !driveConnected}
+                  >
+                    Drive bağlantısını sil
+                  </button>
+                </>
+              )}
+            </div>
+
+            {mediaLabNotice && <p className="ok">{mediaLabNotice}</p>}
+            {mediaLabError && <p className="error">{mediaLabError}</p>}
+            {driveStatus && <p className="hint">{driveStatus}</p>}
+
+            {rows.length === 0 ? (
+              <div className="lab-empty">
+                Əvvəlcə məhsulları cədvələ sal. Sonra burada alternativ image URL
+                strategiyalarını ayrıca test edə bilərsən.
+              </div>
+            ) : mediaLabMode === 'current' ? (
+              <div className="lab-baseline-grid">
+                {rows.slice(0, 12).map((row, rowIndex) => {
+                  const currentImage = getCurrentPrimaryImage(row)
+                  const sourceLabel = normalizeMedia(row.imagesAndVideos).some(
+                    (value) => !VIDEO_EXT.test(value) && isPublicHttpUrl(value),
+                  )
+                    ? 'Custom public URL'
+                    : row._fallbackImageLink
+                      ? 'Feed fallback'
+                      : 'Şəkil yoxdur'
+
+                  return (
+                    <article
+                      className="lab-baseline-card"
+                      key={row._rowId ?? `${row.contentId}-${rowIndex}`}
+                    >
+                      <strong>{row.title || `Setir ${rowIndex + 1}`}</strong>
+                      <span>{sourceLabel}</span>
+                      {isPublicHttpUrl(currentImage) ? (
+                        <a href={currentImage} target="_blank" rel="noreferrer">
+                          Cari şəkli aç
+                        </a>
+                      ) : (
+                        <span className="muted">Public image yoxdur</span>
+                      )}
+                    </article>
+                  )
+                })}
+              </div>
+            ) : (
+              <div className="table-wrap lab-table-wrap">
+                <table className="catalog-table lab-table">
+                  <thead>
+                    <tr>
+                      <th>Məhsul</th>
+                      <th>İndiki şəkil</th>
+                      <th>{mediaLabMode === 'google-drive' ? 'Drive linki' : 'GCS public URL'}</th>
+                      <th>Test URL preview</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((row, rowIndex) => {
+                      const rowKey = getRowLabKey(row, rowIndex)
+                      const entry = mediaLabEntries[rowKey]
+                      const currentImage = getCurrentPrimaryImage(row)
+                      const value =
+                        mediaLabMode === 'google-drive' ? entry?.driveUrl ?? '' : entry?.gcsUrl ?? ''
+                      const previewUrl = getMediaLabUrl(mediaLabMode, entry)
+
+                      return (
+                        <tr key={rowKey}>
+                          <td>
+                            <div className="lab-product-cell">
+                              <strong>{row.title || `Setir ${rowIndex + 1}`}</strong>
+                              <span>{row.contentId || 'Content ID yoxdur'}</span>
+                            </div>
+                          </td>
+                          <td>
+                            {isPublicHttpUrl(currentImage) ? (
+                              <a href={currentImage} target="_blank" rel="noreferrer">
+                                Cari şəkli aç
+                              </a>
+                            ) : (
+                              <span className="muted">Public image yoxdur</span>
+                            )}
+                          </td>
+                          <td>
+                            <div className="lab-input-stack">
+                              <input
+                                type="text"
+                                value={value}
+                                placeholder={
+                                  mediaLabMode === 'google-drive'
+                                    ? 'Drive share linki və ya file id'
+                                    : 'https://storage.googleapis.com/...'
+                                }
+                                onChange={(e) =>
+                                  updateMediaLabEntry(
+                                    rowKey,
+                                    mediaLabMode === 'google-drive' ? 'driveUrl' : 'gcsUrl',
+                                    e.target.value,
+                                  )
+                                }
+                              />
+                              {mediaLabMode === 'google-drive' && (
+                                <label className="lab-file-picker">
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    onChange={(e) => {
+                                      const file = e.target.files?.[0] ?? null
+                                      void uploadSingleRowToGoogleDrive(rowKey, file)
+                                      e.currentTarget.value = ''
+                                    }}
+                                  />
+                                  <span>Bu row üçün şəkil seç və Drive-a yüklə</span>
+                                </label>
+                              )}
+                            </div>
+                          </td>
+                          <td>
+                            {isPublicHttpUrl(previewUrl) ? (
+                              <div className="lab-preview-cell">
+                                <a href={previewUrl} target="_blank" rel="noreferrer">
+                                  Test URL aç
+                                </a>
+                                {mediaLabMode === 'google-drive' && entry?.driveViewUrl && (
+                                  <a href={entry.driveViewUrl} target="_blank" rel="noreferrer">
+                                    Drive faylını aç
+                                  </a>
+                                )}
+                                <code>{previewUrl}</code>
+                                {entry?.driveMessage && (
+                                  <span
+                                    className={`muted ${entry.driveState === 'error' ? 'warn-text' : ''}`}
+                                  >
+                                    {entry.driveMessage}
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="lab-preview-cell">
+                                <span className="muted">
+                                  {value.trim() ? 'Düzgün public URL alınmadı' : 'Hələ daxil edilməyib'}
+                                </span>
+                                {entry?.driveMessage && <span className="muted">{entry.driveMessage}</span>}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
-          </div>
-        </section>
+          </details>
+        </div>
       </div>
 
       {SHOW_LEGACY_CONSOLE && (
