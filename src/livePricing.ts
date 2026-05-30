@@ -20,7 +20,7 @@ type LivePriceResult = {
   salePrice?: string
 }
 
-const API_BASE = '/proxy-api2'
+const API_BASE = (import.meta.env.VITE_LIVE_PRICE_PROXY_PATH as string | undefined)?.trim()
 
 let appProdMapPromise: Promise<Map<string, ApiProductItem>> | null = null
 let disProdMapPromise: Promise<Map<string, ApiProductItem>> | null = null
@@ -62,6 +62,7 @@ async function fetchJson<T>(url: string): Promise<T> {
 }
 
 async function getAppProdMap(): Promise<Map<string, ApiProductItem>> {
+  if (!API_BASE) return EMPTY_PRODUCT_MAP
   if (!appProdMapPromise) {
     appProdMapPromise = fetchJson<ApiProductItem[]>(`${API_BASE}/app_prod.php`)
       .then((list) => new Map(list.map((item) => [item.id, item])))
@@ -74,6 +75,7 @@ async function getAppProdMap(): Promise<Map<string, ApiProductItem>> {
 }
 
 async function getDisProdMap(): Promise<Map<string, ApiProductItem>> {
+  if (!API_BASE) return EMPTY_PRODUCT_MAP
   if (!disProdMapPromise) {
     disProdMapPromise = fetchJson<ApiProductItem[]>(`${API_BASE}/app_disprod.php`)
       .then((list) => new Map(list.map((item) => [item.id, item])))
@@ -88,6 +90,7 @@ async function getDisProdMap(): Promise<Map<string, ApiProductItem>> {
 async function getViewPrice(
   productId: string,
 ): Promise<{ price: number | null; taksit: number | null }> {
+  if (!API_BASE) return { price: null, taksit: null }
   const data = await fetchJson<ViewPriceResponse>(
     `${API_BASE}/app_view.php?id=${encodeURIComponent(productId)}`,
   )
@@ -156,8 +159,8 @@ export async function getLivePriceForItem(item: ParsedItem): Promise<LivePriceRe
       const regular =
         regularCandidates.length > 0 ? Math.max(...regularCandidates) : undefined
 
-      // myshops UI frequently exposes two numbers in `price` + `taksit`.
-      // If taksit is higher, we treat it as regular `price` and lower value as `sale_price`.
+      // Some merchant APIs expose both current and installment/list prices.
+      // If the secondary value is higher, use it as regular `price` and the lower value as `sale_price`.
       if (sale != null && regular != null && regular - sale > 0.1) {
         return {
           price: toAzn(regular),

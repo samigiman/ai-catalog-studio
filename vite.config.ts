@@ -6,25 +6,22 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const geminiKey = env.GEMINI_API_KEY?.trim()
   const openAiKey = env.OPENAI_API_KEY?.trim()
+  const livePriceProxyTarget = env.LIVE_PRICE_PROXY_TARGET?.trim()
 
   const proxy: Record<string, string | ProxyOptions> = {
-    // Brauzerdə CORS olmadan myshops.az/products.xml çəkmək üçün (yalnız `npm run dev`)
-    '/proxy-products.xml': {
-      target: 'https://myshops.az',
-      changeOrigin: true,
-      rewrite: () => '/products.xml',
-    },
-    // Canli qiymet/endirim qiymeti ucun myshops API
-    '/proxy-api2': {
-      target: 'https://new.myshops.az',
-      changeOrigin: true,
-      rewrite: (path) => path.replace(/^\/proxy-api2/, '/api2'),
-    },
     '/proxy-catbox-upload': {
       target: 'https://catbox.moe',
       changeOrigin: true,
       rewrite: () => '/user/api.php',
     },
+  }
+
+  if (livePriceProxyTarget) {
+    proxy['/proxy-live-pricing'] = {
+      target: livePriceProxyTarget,
+      changeOrigin: true,
+      rewrite: (path) => path.replace(/^\/proxy-live-pricing/, ''),
+    }
   }
 
   if (openAiKey) {

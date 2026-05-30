@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+  <channel>
+    <title>Sample Merchant Feed</title>
+    <link>https://example.com</link>
+    <description>Small demo feed for AI Catalog Studio.</description>
+    <item>
+      <g:id>SKU-1001</g:id>
+      <g:title>Wireless Noise-Canceling Headphones</g:title>
+      <g:description>Over-ear wireless headphones with active noise cancellation and long battery life.</g:description>
+      <g:link>https://example.com/products/wireless-headphones</g:link>
+      <g:price>129.00 USD</g:price>
+      <g:image_link>https://example.com/images/wireless-headphones.jpg</g:image_link>
+      <g:brand>Example Audio</g:brand>
+      <g:availability>in stock</g:availability>
+      <g:condition>new</g:condition>
+      <g:fb_product_category>Electronics &gt; Audio</g:fb_product_category>
+    </item>
+    <item>
+      <g:id>SKU-1002</g:id>
+      <g:title>Stainless Steel Smart Bottle</g:title>
+      <g:description>Insulated smart water bottle with hydration reminders and temperature display.</g:description>
+      <g:link>https://example.com/products/smart-bottle</g:link>
+      <g:price>49.00 USD</g:price>
+      <g:image_link>https://example.com/images/smart-bottle.jpg</g:image_link>
+      <g:brand>Example Home</g:brand>
+      <g:availability>in stock</g:availability>
+      <g:condition>new</g:condition>
+      <g:fb_product_category>Home &amp; Garden</g:fb_product_category>
+    </item>
+  </channel>
+</rss>

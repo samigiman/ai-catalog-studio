@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -38,7 +39,12 @@ import type { CatalogRow } from './types'
 import './App.css'
 import './Workspace.css'
 
-const FEED_URL = '/proxy-products.xml'
+const FEED_URL =
+  (import.meta.env.VITE_PRODUCT_FEED_URL as string | undefined)?.trim() ||
+  '/sample-products.xml'
+const LIVE_PRICE_PROXY_PATH = (
+  import.meta.env.VITE_LIVE_PRICE_PROXY_PATH as string | undefined
+)?.trim()
 const GOOGLE_DRIVE_CLIENT_ID = (
   import.meta.env.VITE_GOOGLE_DRIVE_CLIENT_ID as string | undefined
 )?.trim() ?? ''
@@ -78,11 +84,12 @@ const HEADERS: { key: keyof CatalogRow; label: string; wide?: boolean }[] = [
 
 const VIDEO_EXT = /\.(mp4|mov|webm|m4v)(\?|$)/i
 const MAX_UPLOAD_FILES_PER_BATCH = 300
-const MAX_AI_READ_FILES_PER_BATCH = 300
-const AI_READ_CONCURRENCY = 3
+const AI_FILES_PER_PASS = 8
+const AI_READ_CONCURRENCY = 1
+const AI_REQUEST_SPACING_MS = 6500
 const MEDIA_UPLOAD_CONCURRENCY = 3
 const UPLOAD_PROCESS_CHUNK_SIZE = 40
-const SHOW_LEGACY_CONSOLE = false
+
 
 type UploadMatchStatus = 'auto-added' | 'needs-choice' | 'not-found' | 'chosen'
 type MediaLabMode = 'current' | 'google-drive' | 'gcs-public'
@@ -95,6 +102,7 @@ type UploadMatchCard = {
   query: string
   ocrQuery?: string
   colorHint?: string
+  aiError?: string
   previewUrl: string
   status: UploadMatchStatus
   candidates: ParsedItem[]
@@ -112,6 +120,11 @@ type CandidateRankEntry = {
   item: ParsedItem
   score: number
   matchedQueries: string[]
+}
+
+type UploadAiEntry = {
+  file: File
+  card: UploadMatchCard
 }
 
 type MediaLabEntry = {
@@ -383,6 +396,12 @@ function normalizeSearch(value: string): string {
     .trim()
 }
 
+function compactInlineText(value: string, maxLength: number): string {
+  const cleaned = value.replace(/\s+/g, ' ').trim()
+  if (cleaned.length <= maxLength) return cleaned
+  return `${cleaned.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
+}
+
 function queryFromFileName(fileName: string): string {
   const withoutExt = fileName.replace(/\.[^.]+$/, '')
   return withoutExt
@@ -398,7 +417,7 @@ function queryFromOcrText(rawText: string): string {
 
   const tokens = normalized
     .split(' ')
-    .filter((token) => token.length > 2)
+    .filter((token) => token.length > 1)
     .filter((token) => /[a-z0-9\u0400-\u04ff]/.test(token))
     .slice(0, 10)
 
@@ -698,6 +717,29 @@ function describeConfidence(confidence: CatalogCandidateDecision['confidence']):
   return 'aşağı'
 }
 
+function isAiQuotaError(error: string | undefined): boolean {
+  const normalized = (error ?? '').toLowerCase()
+  if (!normalized) return false
+  return (
+    normalized.includes('429') &&
+    (normalized.includes('quota') ||
+      normalized.includes('billing') ||
+      normalized.includes('rate limit'))
+  )
+}
+
+function summarizeAiError(error: string | undefined): string {
+  const normalized = (error ?? '').trim()
+  if (!normalized) return 'AI analizi alınmadı.'
+  if (isAiQuotaError(normalized)) {
+    return 'Gemini kvotası bitib. Billing və limitlər yoxlanmalıdır.'
+  }
+  if (normalized.toLowerCase().includes('openai proxy deaktivdir')) {
+    return 'OpenAI proxy aktiv deyil.'
+  }
+  return compactInlineText(normalized, 140)
+}
+
 function normalizeEngineLabel(engine: string): string {
   const normalized = engine.trim().toLowerCase()
   if (!normalized) return ''
@@ -756,7 +798,7 @@ function applyAiDraftToCatalogRow(
 }
 
 function buildAiMatchNote(
-  card: Pick<UploadMatchCard, 'aiAnalysis' | 'aiDecision' | 'colorHint'>,
+  card: Pick<UploadMatchCard, 'aiAnalysis' | 'aiDecision' | 'colorHint' | 'aiError'>,
 ): string {
   const analysis = card.aiAnalysis
   if (card.aiDecision?.selectedContentId) {
@@ -766,6 +808,18 @@ function buildAiMatchNote(
   }
 
   if (!analysis) {
+    if (card.aiError) {
+      const normalizedError = card.aiError.toLowerCase()
+      const errorLabel = normalizedError.includes('openai')
+        ? 'OpenAI xətası'
+        : normalizedError.includes('gemini')
+          ? 'Gemini xətası'
+          : 'AI xətası'
+      const shortError = summarizeAiError(card.aiError)
+      return card.colorHint
+        ? `${errorLabel}: ${shortError} • Rəng ipucu: ${card.colorHint}`
+        : `${errorLabel}: ${shortError}`
+    }
     return card.colorHint
       ? `Gemini analizi alınmadı • Rəng ipucu: ${card.colorHint}`
       : 'Gemini analizi alınmadı.'
@@ -781,6 +835,40 @@ function buildAiMatchNote(
   ].filter(Boolean)
 
   return parts.join(' • ')
+}
+
+function buildUploadCardSearchText(card: UploadMatchCard): string {
+  const analysis = card.aiAnalysis
+  const text = [
+    card.fileName,
+    card.query,
+    card.ocrQuery,
+    card.colorHint,
+    card.selectedTitle,
+    analysis?.engine,
+    analysis?.brand,
+    analysis?.series,
+    analysis?.model,
+    analysis?.variant,
+    analysis?.storage,
+    analysis?.color,
+    analysis?.category,
+    analysis?.searchQuery,
+    analysis?.metaTitle,
+    analysis?.metaDescription,
+    analysis?.matchSignals.join(' '),
+    card.candidates.map((candidate) => `${candidate.title} ${candidate.contentId}`).join(' '),
+  ]
+    .filter(Boolean)
+    .join(' ')
+
+  return normalizeSearch(text)
+}
+
+function matchesUploadCardSearch(card: UploadMatchCard, query: string): boolean {
+  const normalizedQuery = normalizeSearch(query)
+  if (!normalizedQuery) return true
+  return buildUploadCardSearchText(card).includes(normalizedQuery)
 }
 
 function withRowMeta(row: CatalogRow, sourceUploadId?: string): CatalogRow {
@@ -915,6 +1003,7 @@ function App() {
   const [uploadMatches, setUploadMatches] = useState<UploadMatchCard[]>([])
   const [manualSearchDrafts, setManualSearchDrafts] = useState<Record<string, string>>({})
   const [expandedCandidates, setExpandedCandidates] = useState<Record<string, boolean>>({})
+  const [reviewSearchQuery, setReviewSearchQuery] = useState('')
   const [productColorById, setProductColorById] = useState<Record<string, string>>({})
   const [uploadNotice, setUploadNotice] = useState<string | null>(null)
   const [aiReadProgress, setAiReadProgress] = useState<{
@@ -938,6 +1027,7 @@ function App() {
     () => filterByName(feedItems, searchQuery),
     [feedItems, searchQuery],
   )
+  const deferredReviewSearchQuery = useDeferredValue(reviewSearchQuery)
 
   useEffect(() => {
     if (!tableError && !tableNotice) return
@@ -1002,7 +1092,7 @@ function App() {
       import.meta.env.VITE_OPENAI_VISION_MODEL as string | undefined
     )?.trim()
     if (openAiModel) return openAiModel
-    return 'gemini-3.1-pro-preview'
+    return 'gemini-2.5-flash'
   }, [])
 
   const mediaLabReadyCounts = useMemo(() => {
@@ -1036,17 +1126,39 @@ function App() {
     ): Promise<{
       query: string
       analysis: ImageProductAnalysis | null
+      error?: string
     }> => {
       try {
         const analysis = await analyzeProductImageAi(file)
-        const query = queryFromOcrText(analysis?.searchQuery ?? '')
-        if (analysis && query) {
-          return { query, analysis: { ...analysis, searchQuery: query } }
+        if (analysis) {
+          const normalizedQuery =
+            queryFromOcrText(analysis.searchQuery) ||
+            normalizeSearch(analysis.searchQuery) ||
+            queryFromOcrText(analysis.productName) ||
+            normalizeSearch(analysis.productName)
+
+          if (normalizedQuery) {
+            return {
+              query: normalizedQuery,
+              analysis: { ...analysis, searchQuery: normalizedQuery },
+            }
+          }
         }
-      } catch {
-        return { query: '', analysis: null }
+      } catch (error) {
+        return {
+          query: '',
+          analysis: null,
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Gemini analizi zamani gozlenilmez xeta oldu.',
+        }
       }
-      return { query: '', analysis: null }
+      return {
+        query: '',
+        analysis: null,
+        error: 'Gemini sekilden istifade oluna bilen strukturlaşdirilmiş cavab qaytarmadi.',
+      }
     },
     [],
   )
@@ -1075,6 +1187,11 @@ function App() {
   }, [])
 
   const loadProductColorMap = useCallback(async (): Promise<Record<string, string>> => {
+    if (!LIVE_PRICE_PROXY_PATH) {
+      setProductColorById({})
+      return {}
+    }
+
     if (productColorMapPromiseRef.current) {
       return productColorMapPromiseRef.current
     }
@@ -1082,8 +1199,8 @@ function App() {
     const promise = (async () => {
       try {
         const [appProdRes, disProdRes] = await Promise.all([
-          fetch('/proxy-api2/app_prod.php'),
-          fetch('/proxy-api2/app_disprod.php'),
+          fetch(`${LIVE_PRICE_PROXY_PATH}/app_prod.php`),
+          fetch(`${LIVE_PRICE_PROXY_PATH}/app_disprod.php`),
         ])
 
         if (!appProdRes.ok || !disProdRes.ok) {
@@ -1363,6 +1480,34 @@ function App() {
     [catalogMediaProvider],
   )
 
+  const ensureUploadedMediaForSelection = useCallback(
+    async (uploadId: string, rowKey: string): Promise<string> => {
+      const cached = getCachedUploadedUrl(uploadId)?.trim() ?? ''
+      if (cached) return cached
+
+      let uploadedUrl: string | null = null
+      if (catalogMediaProvider === 'drive') {
+        uploadedUrl = await uploadDriveMediaForUploadId(uploadId, rowKey)
+        if (!uploadedUrl) {
+          uploadedUrl = await uploadLocalMediaForUploadId(uploadId)
+        }
+      } else {
+        uploadedUrl = await uploadLocalMediaForUploadId(uploadId)
+        if (!uploadedUrl && GOOGLE_DRIVE_CLIENT_ID) {
+          uploadedUrl = await uploadDriveMediaForUploadId(uploadId, rowKey)
+        }
+      }
+
+      return uploadedUrl?.trim() ?? ''
+    },
+    [
+      catalogMediaProvider,
+      getCachedUploadedUrl,
+      uploadDriveMediaForUploadId,
+      uploadLocalMediaForUploadId,
+    ],
+  )
+
   const buildRowForUploadSelection = useCallback(
     async (
       uploadId: string,
@@ -1377,28 +1522,24 @@ function App() {
       )
       let row = withUploadPreview(withRowMeta(priced, uploadId), previewUrl)
       const rowKey = row._rowId ?? getRowLabKey(row, 0)
-      const uploadedUrl = getCachedUploadedUrl(uploadId)?.trim() ?? ''
+      const uploadedUrl = await ensureUploadedMediaForSelection(uploadId, rowKey)
       if (uploadedUrl) {
         row = {
           ...row,
-          _currentMediaUrl:
-            catalogMediaProvider === 'current' ? uploadedUrl : row._currentMediaUrl,
-          _driveMediaUrl: catalogMediaProvider === 'drive' ? uploadedUrl : row._driveMediaUrl,
+          _currentMediaUrl: uploadedUrl,
+          _driveMediaUrl: uploadedUrl,
           imagesAndVideos: buildMediaWithCatalogProvider(
             {
               ...row,
-              _currentMediaUrl:
-                catalogMediaProvider === 'current' ? uploadedUrl : row._currentMediaUrl,
-              _driveMediaUrl:
-                catalogMediaProvider === 'drive' ? uploadedUrl : row._driveMediaUrl,
+              _currentMediaUrl: uploadedUrl,
+              _driveMediaUrl: uploadedUrl,
             },
             rowKey,
             catalogMediaProvider,
             mediaLabEntries,
             {
-              currentUrl:
-                catalogMediaProvider === 'current' ? uploadedUrl : row._currentMediaUrl,
-              driveUrl: catalogMediaProvider === 'drive' ? uploadedUrl : row._driveMediaUrl,
+              currentUrl: uploadedUrl,
+              driveUrl: uploadedUrl,
             },
           ),
         }
@@ -1408,7 +1549,7 @@ function App() {
     [
       buildRowWithLivePricing,
       catalogMediaProvider,
-      getCachedUploadedUrl,
+      ensureUploadedMediaForSelection,
       mediaLabEntries,
     ],
   )
@@ -1562,6 +1703,270 @@ function App() {
     [feedItems, loadFeedItems, manualSearchDrafts, productColorById],
   )
 
+  const processAiEntries = useCallback(
+    async (
+      aiEntries: UploadAiEntry[],
+      sourceItems: ParsedItem[],
+      colorMap: Record<string, string>,
+    ): Promise<{ processed: number; quotaErrorHit: boolean }> => {
+      if (aiEntries.length === 0) {
+        setAiReadProgress(null)
+        return { processed: 0, quotaErrorHit: false }
+      }
+
+      setAiReadProgress({
+        done: 0,
+        total: aiEntries.length,
+      })
+
+      const patchById = new Map<string, Partial<UploadMatchCard>>()
+      const autoFromOcr: Array<{
+        uploadId: string
+        item: ParsedItem
+        previewUrl: string
+        analysis?: ImageProductAnalysis | null
+      }> = []
+      let quotaErrorHit = false
+
+      const results = await mapWithConcurrency(
+        aiEntries,
+        AI_READ_CONCURRENCY,
+        async (entry, index) => {
+          if (index > 0 && AI_REQUEST_SPACING_MS > 0) {
+            await new Promise((resolve) => window.setTimeout(resolve, AI_REQUEST_SPACING_MS))
+          }
+          const { query: ocrQuery, analysis, error } = await analyzeUploadImage(entry.file)
+          setAiReadProgress((prev) =>
+            prev
+              ? { ...prev, done: Math.min(prev.total, prev.done + 1) }
+              : prev,
+          )
+          const colorHint = buildColorHint(
+            entry.card.query,
+            ocrQuery,
+            entry.card.colorHint,
+            analysis?.color,
+          )
+          const ranked = rankCandidatesForUpload(
+            sourceItems,
+            ocrQuery || entry.card.query,
+            analysis,
+            colorMap,
+          )
+          const mergedCandidates = mergeCandidateLists(
+            ranked.map((candidate) => candidate.item),
+            entry.card.candidates,
+          )
+          const finalRanked = rankCandidatesForUpload(
+            mergedCandidates,
+            ocrQuery || entry.card.query,
+            analysis,
+            colorMap,
+          )
+          const mergedBase =
+            finalRanked.length > 0
+              ? finalRanked.map((candidate) => candidate.item)
+              : mergedCandidates
+          const aiDecision =
+            !error && analysis && mergedBase.length > 1
+              ? await chooseBestCatalogCandidateAi(
+                  entry.file,
+                  analysis,
+                  mergedBase,
+                  colorMap,
+                ).catch(() => null)
+              : null
+          const merged = reorderCandidatesByDecision(mergedBase, aiDecision ?? undefined)
+
+          return {
+            entry,
+            ocrQuery,
+            analysis,
+            merged,
+            finalRanked,
+            colorHint,
+            aiDecision,
+            error,
+          }
+        },
+      )
+
+      for (const result of results) {
+        if (!result) continue
+        const {
+          entry,
+          ocrQuery,
+          analysis,
+          merged,
+          finalRanked,
+          colorHint,
+          aiDecision,
+          error,
+        } = result
+
+        if (isAiQuotaError(error)) {
+          quotaErrorHit = true
+        }
+
+        const aiMatchNote = buildAiMatchNote({
+          aiAnalysis: analysis ?? undefined,
+          aiDecision: aiDecision ?? undefined,
+          colorHint,
+          aiError: error,
+        })
+
+        if (
+          merged[0] &&
+          ((aiDecision?.selectedContentId === merged[0].contentId &&
+            aiDecision.confidence === 'high') ||
+            shouldAutoSelectCandidate(
+              finalRanked,
+              ocrQuery || entry.card.query,
+              analysis,
+            ))
+        ) {
+          patchById.set(entry.card.id, {
+            ocrQuery,
+            aiAnalysis: analysis ?? undefined,
+            aiDecision: aiDecision ?? undefined,
+            aiError: error,
+            aiMatchNote,
+            colorHint,
+            candidates: merged,
+            status: 'auto-added',
+            selectedTitle: merged[0].title,
+            selectedContentId: merged[0].contentId,
+          })
+          autoFromOcr.push({
+            uploadId: entry.card.id,
+            item: merged[0],
+            previewUrl: entry.card.previewUrl,
+            analysis,
+          })
+        } else if (merged.length > 1) {
+          patchById.set(entry.card.id, {
+            ocrQuery,
+            aiAnalysis: analysis ?? undefined,
+            aiDecision: aiDecision ?? undefined,
+            aiError: error,
+            aiMatchNote,
+            colorHint,
+            candidates: merged,
+            status: 'needs-choice',
+          })
+        } else {
+          patchById.set(entry.card.id, {
+            ocrQuery,
+            aiAnalysis: analysis ?? undefined,
+            aiDecision: aiDecision ?? undefined,
+            aiError: error,
+            aiMatchNote,
+            colorHint,
+            candidates: [],
+            status: 'not-found',
+          })
+        }
+      }
+
+      if (patchById.size > 0) {
+        setUploadMatches((prev) =>
+          prev.map((card) => {
+            if (card.status === 'chosen') return card
+            const patch = patchById.get(card.id)
+            return patch ? { ...card, ...patch } : card
+          }),
+        )
+        setManualSearchDrafts((prev) => {
+          const next = { ...prev }
+          for (const [id, patch] of patchById.entries()) {
+            if (patch.ocrQuery?.trim()) {
+              next[id] = patch.ocrQuery
+            }
+          }
+          return next
+        })
+      }
+
+      if (autoFromOcr.length > 0) {
+        setLoadingLivePrices(true)
+        try {
+          const rowsFromOcr = await mapWithConcurrency(
+            autoFromOcr,
+            MEDIA_UPLOAD_CONCURRENCY,
+            async ({ uploadId, item, previewUrl, analysis }) =>
+              buildRowForUploadSelection(uploadId, item, previewUrl, analysis),
+          )
+          setRows((prev) => [...prev, ...rowsFromOcr])
+        } finally {
+          setLoadingLivePrices(false)
+        }
+      }
+
+      setAiReadProgress(null)
+      return { processed: aiEntries.length, quotaErrorHit }
+    },
+    [analyzeUploadImage, buildRowForUploadSelection],
+  )
+
+  const continueQueuedAiAnalysis = useCallback(async () => {
+    const queuedCards = uploadMatches.filter(
+      (card) =>
+        card.status !== 'chosen' &&
+        card.status !== 'auto-added' &&
+        !card.aiAnalysis &&
+        !card.aiError &&
+        !card.ocrQuery,
+    )
+    if (processingUploads || queuedCards.length === 0) return
+
+    setProcessingUploads(true)
+    try {
+      const [sourceItems, colorMap] = await Promise.all([
+        feedItems.length > 0 ? Promise.resolve(feedItems) : loadFeedItems(),
+        loadProductColorMap(),
+      ])
+      if (sourceItems.length === 0) return
+
+      const aiEntries = queuedCards
+        .slice(0, AI_FILES_PER_PASS)
+        .flatMap((card) => {
+          const file = uploadFileByIdRef.current[card.id]
+          return file ? [{ file, card }] : []
+        })
+
+      const missingCount = Math.min(AI_FILES_PER_PASS, queuedCards.length) - aiEntries.length
+      const { processed, quotaErrorHit } = await processAiEntries(aiEntries, sourceItems, colorMap)
+
+      const nextPendingCount = Math.max(0, queuedCards.length - processed - missingCount)
+      const noticeParts: string[] = []
+      if (processed > 0) {
+        noticeParts.push(`AI bu keçiddə ${processed} şəkli analiz etdi.`)
+      }
+      if (nextPendingCount > 0) {
+        noticeParts.push(`${nextPendingCount} şəkil AI növbəsində qalır.`)
+      }
+      if (missingCount > 0) {
+        noticeParts.push(`${missingCount} şəkilin lokal faylı tapılmadı.`)
+      }
+      if (quotaErrorHit) {
+        noticeParts.push(
+          'Gemini kvotası bitdiyi üçün AI bu keçiddə dayandı. Sonra yenidən davam etdirə bilərsən.',
+        )
+      }
+      setUploadNotice(noticeParts.length > 0 ? noticeParts.join(' ') : null)
+    } finally {
+      setAiReadProgress(null)
+      setProcessingUploads(false)
+    }
+  }, [
+    feedItems,
+    loadFeedItems,
+    loadProductColorMap,
+    uploadMatches,
+    processAiEntries,
+    processingUploads,
+  ])
+
   const handleBatchImageUpload = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
       const incomingFiles = [...(event.target.files ?? [])]
@@ -1591,10 +1996,8 @@ function App() {
         ])
         if (sourceItems.length === 0) return
 
-        let remainingAiBudget = MAX_AI_READ_FILES_PER_BATCH
-        let processedAiCount = 0
-        let aiLimitHit = false
         const fileChunks = chunkList(files, UPLOAD_PROCESS_CHUNK_SIZE)
+        const initialAiEntries: UploadAiEntry[] = []
 
         for (const [chunkIndex, fileChunk] of fileChunks.entries()) {
           const entries = fileChunk.map((file, index) => {
@@ -1652,6 +2055,10 @@ function App() {
           })
 
           const cards: UploadMatchCard[] = entries.map((entry) => entry.card)
+          const roomLeft = Math.max(0, AI_FILES_PER_PASS - initialAiEntries.length)
+          if (roomLeft > 0) {
+            initialAiEntries.push(...entries.slice(0, roomLeft))
+          }
 
           setUploadMatches((prev) => [
             ...prev,
@@ -1668,215 +2075,39 @@ function App() {
             return next
           })
 
-          if (entries.length > 0) {
-            if (remainingAiBudget <= 0) {
-              aiLimitHit = true
-            } else {
-              const aiEntries = entries.slice(0, remainingAiBudget)
-              if (entries.length > aiEntries.length) {
-                aiLimitHit = true
-              }
-              remainingAiBudget -= aiEntries.length
-
-              if (aiEntries.length > 0) {
-                setAiReadProgress({
-                  done: processedAiCount,
-                  total: processedAiCount + aiEntries.length,
-                })
-                const patchById = new Map<string, Partial<UploadMatchCard>>()
-                const autoFromOcr: Array<{
-                  uploadId: string
-                  item: ParsedItem
-                  previewUrl: string
-                  analysis?: ImageProductAnalysis | null
-                }> = []
-
-                const results = await mapWithConcurrency(
-                  aiEntries,
-                  AI_READ_CONCURRENCY,
-                  async (entry) => {
-                    const { query: ocrQuery, analysis } = await analyzeUploadImage(entry.file)
-                    setAiReadProgress((prev) =>
-                      prev
-                        ? { ...prev, done: Math.min(prev.total, prev.done + 1) }
-                        : prev,
-                    )
-                    const colorHint = buildColorHint(
-                      entry.card.query,
-                      ocrQuery,
-                      entry.card.colorHint,
-                      analysis?.color,
-                    )
-                    const ranked = rankCandidatesForUpload(
-                      sourceItems,
-                      ocrQuery || entry.card.query,
-                      analysis,
-                      colorMap,
-                    )
-                    const mergedCandidates = mergeCandidateLists(
-                      ranked.map((candidate) => candidate.item),
-                      entry.card.candidates,
-                    )
-                    const finalRanked = rankCandidatesForUpload(
-                      mergedCandidates,
-                      ocrQuery || entry.card.query,
-                      analysis,
-                      colorMap,
-                    )
-                    const mergedBase =
-                      finalRanked.length > 0
-                        ? finalRanked.map((candidate) => candidate.item)
-                        : mergedCandidates
-                    const aiDecision =
-                      mergedBase.length > 1
-                        ? await chooseBestCatalogCandidateAi(
-                            entry.file,
-                            analysis,
-                            mergedBase,
-                            colorMap,
-                          ).catch(() => null)
-                        : null
-                    const merged = reorderCandidatesByDecision(mergedBase, aiDecision ?? undefined)
-                    return {
-                      entry,
-                      ocrQuery,
-                      analysis,
-                      merged,
-                      finalRanked,
-                      colorHint,
-                      aiDecision,
-                    }
-                  },
-                )
-
-                for (const result of results) {
-                  if (!result) continue
-                  const {
-                    entry,
-                    ocrQuery,
-                    analysis,
-                    merged,
-                    finalRanked,
-                    colorHint,
-                    aiDecision,
-                  } = result
-                  const aiMatchNote = buildAiMatchNote({
-                    aiAnalysis: analysis ?? undefined,
-                    aiDecision: aiDecision ?? undefined,
-                    colorHint,
-                  })
-                  if (
-                    merged[0] &&
-                    ((aiDecision?.selectedContentId === merged[0].contentId &&
-                      aiDecision.confidence === 'high') ||
-                      shouldAutoSelectCandidate(
-                        finalRanked,
-                        ocrQuery || entry.card.query,
-                        analysis,
-                      ))
-                  ) {
-                    patchById.set(entry.card.id, {
-                      ocrQuery,
-                      aiAnalysis: analysis ?? undefined,
-                      aiDecision: aiDecision ?? undefined,
-                      aiMatchNote,
-                      colorHint,
-                      candidates: merged,
-                      status: 'auto-added',
-                      selectedTitle: merged[0].title,
-                      selectedContentId: merged[0].contentId,
-                    })
-                    autoFromOcr.push({
-                      uploadId: entry.card.id,
-                      item: merged[0],
-                      previewUrl: entry.card.previewUrl,
-                      analysis,
-                    })
-                  } else if (merged.length > 1) {
-                    patchById.set(entry.card.id, {
-                      ocrQuery,
-                      aiAnalysis: analysis ?? undefined,
-                      aiDecision: aiDecision ?? undefined,
-                      aiMatchNote,
-                      colorHint,
-                      candidates: merged,
-                      status: 'needs-choice',
-                    })
-                  } else {
-                    patchById.set(entry.card.id, {
-                      ocrQuery,
-                      aiAnalysis: analysis ?? undefined,
-                      aiDecision: aiDecision ?? undefined,
-                      aiMatchNote,
-                      colorHint,
-                      candidates: [],
-                      status: 'not-found',
-                    })
-                  }
-                }
-
-                if (patchById.size > 0) {
-                  setUploadMatches((prev) =>
-                    prev.map((card) => {
-                      if (card.status === 'chosen') return card
-                      const patch = patchById.get(card.id)
-                      return patch ? { ...card, ...patch } : card
-                    }),
-                  )
-                  setManualSearchDrafts((prev) => {
-                    const next = { ...prev }
-                    for (const [id, patch] of patchById.entries()) {
-                      if (patch.ocrQuery?.trim()) {
-                        next[id] = patch.ocrQuery
-                      }
-                    }
-                    return next
-                  })
-                }
-
-                if (autoFromOcr.length > 0) {
-                  setLoadingLivePrices(true)
-                  try {
-                    const rowsFromOcr = await mapWithConcurrency(
-                      autoFromOcr,
-                      MEDIA_UPLOAD_CONCURRENCY,
-                      async ({ uploadId, item, previewUrl, analysis }) =>
-                        buildRowForUploadSelection(uploadId, item, previewUrl, analysis),
-                    )
-                    setRows((prev) => [...prev, ...rowsFromOcr])
-                  } finally {
-                    setLoadingLivePrices(false)
-                  }
-                }
-
-                processedAiCount += aiEntries.length
-              }
-            }
-          }
-
           if (chunkIndex < fileChunks.length - 1) {
             await waitForNextPaint()
           }
         }
 
-        if (aiLimitHit) {
-          noticeParts.push(
-            `AI oxunuş bu batch-da ${MAX_AI_READ_FILES_PER_BATCH} kart ilə məhdudlaşdırıldı.`,
-          )
-          setUploadNotice(noticeParts.join(' '))
+        let quotaErrorHit = false
+        if (initialAiEntries.length > 0) {
+          const result = await processAiEntries(initialAiEntries, sourceItems, colorMap)
+          quotaErrorHit = result.quotaErrorHit
         }
+
+        if (files.length > AI_FILES_PER_PASS) {
+          noticeParts.push(
+            `AI bu dəfə yalnız ilk ${Math.min(files.length, AI_FILES_PER_PASS)} şəkli analiz etdi. Qalan ${Math.max(0, files.length - AI_FILES_PER_PASS)} şəkil növbədə saxlanıldı.`,
+          )
+        }
+        if (quotaErrorHit) {
+          noticeParts.push(
+            'Gemini kvotası bitdiyi üçün AI bu keçiddə dayandı. Qalan şəkillər növbədə qaldı.',
+          )
+        }
+        setUploadNotice(noticeParts.length > 0 ? noticeParts.join(' ') : null)
       } finally {
         setAiReadProgress(null)
         setProcessingUploads(false)
       }
     },
     [
-      buildRowForUploadSelection,
-      analyzeUploadImage,
       feedItems,
       getCachedUploadedUrl,
       loadFeedItems,
       loadProductColorMap,
+      processAiEntries,
     ],
   )
 
@@ -2520,6 +2751,36 @@ function App() {
     [uploadMatches],
   )
 
+  const pendingAiCards = useMemo(
+    () =>
+      uploadMatches.filter(
+        (card) =>
+          card.status !== 'chosen' &&
+          card.status !== 'auto-added' &&
+          !card.aiAnalysis &&
+          !card.aiError &&
+          !card.ocrQuery,
+      ),
+    [uploadMatches],
+  )
+
+  const activeReviewSearch = deferredReviewSearchQuery.trim()
+
+  const filteredReviewUploadCards = useMemo(
+    () =>
+      reviewUploadCards.filter((card) => matchesUploadCardSearch(card, activeReviewSearch)),
+    [activeReviewSearch, reviewUploadCards],
+  )
+
+  const filteredUnmatchedUploadCards = useMemo(
+    () =>
+      unmatchedUploadCards.filter((card) => matchesUploadCardSearch(card, activeReviewSearch)),
+    [activeReviewSearch, unmatchedUploadCards],
+  )
+
+  const reviewVisibleCount =
+    filteredReviewUploadCards.length + filteredUnmatchedUploadCards.length
+
   const assistantBusyLabel = useMemo(() => {
     if (loadingFeed) return 'Məhsul məlumatları hazırlanır.'
     if (processingUploads) return 'Şəkillər tanınır və uyğun məhsullar axtarılır.'
@@ -2581,7 +2842,7 @@ function App() {
         <div className="workspace-app">
           <header className="workspace-hero card">
             <div className="workspace-hero-copy">
-              <p className="workspace-kicker">MyShops AI Catalog Studio</p>
+              <p className="workspace-kicker">AI Catalog Studio</p>
               <h1>Upload et, AI yoxlasın, Meta row hazır olsun.</h1>
               <p className="workspace-lead">
                 Bu panel birbaşa iş üçündür: feed statusu, şəkil upload-u, AI qərarı,
@@ -2716,8 +2977,9 @@ function App() {
                 </div>
               </div>
               <p className="workspace-card-copy">
-                İndi hər şəkil əvvəl AI analizindən keçir. Fayl adı sadəcə yardımçı siqnaldır;
-                yekun uyğunlaşdırma vizual analiz və namizəd qərarı ilə verilir.
+                Bütün şəkillər dərhal qəbul olunur, AI isə onları hissə-hissə analiz edir.
+                Fayl adı sadəcə yardımçı siqnaldır; yekun uyğunlaşdırma vizual analiz və
+                namizəd qərarı ilə verilir.
               </p>
               <div className="workspace-actions">
                 <input
@@ -2750,12 +3012,22 @@ function App() {
                 >
                   Top seçimi tətbiq et
                 </button>
+                <button
+                  type="button"
+                  onClick={() => void continueQueuedAiAnalysis()}
+                  disabled={processingUploads || pendingAiCards.length === 0}
+                >
+                  {processingUploads
+                    ? 'AI batch işləyir...'
+                    : `AI davam et (${Math.min(pendingAiCards.length, AI_FILES_PER_PASS)})`}
+                </button>
               </div>
               <div className="workspace-upload-stats">
                 <span className="stat-pill ok">Auto: {uploadStats.autoAdded}</span>
                 <span className="stat-pill info">Review: {uploadStats.needsChoice}</span>
                 <span className="stat-pill done">Seçilib: {uploadStats.chosen}</span>
                 <span className="stat-pill warn">Tapılmayıb: {uploadStats.notFound}</span>
+                <span className="stat-pill">AI növbə: {pendingAiCards.length}</span>
               </div>
               {uploadNotice && <p className="hint warning">{uploadNotice}</p>}
               {aiReadProgress && aiReadProgress.total > 0 && (
@@ -2839,41 +3111,48 @@ function App() {
                 </div>
                 <span>{selectedUploadCards.length} kart hazırdır</span>
               </div>
+              <p className="workspace-board-copy">
+                Bu hissədə limit yoxdur. Seçilmiş kartların hamısı aşağıdakı listdə görünür.
+              </p>
 
-              <div className="workspace-selected-grid">
-                {selectedUploadCards.slice(0, 8).map((card) => {
-                  const selectedColor = card.selectedContentId
-                    ? productColorById[card.selectedContentId]
-                    : ''
+              <div className="workspace-selected-list">
+                <div className="workspace-selected-grid">
+                  {selectedUploadCards.map((card) => {
+                    const selectedColor = card.selectedContentId
+                      ? productColorById[card.selectedContentId]
+                      : ''
 
-                  return (
-                    <article className="workspace-selected-card" key={card.id}>
-                      <img src={card.previewUrl} alt={card.fileName} />
-                      <div>
-                        <strong>{card.selectedTitle ?? card.fileName}</strong>
-                        <p>{card.aiMatchNote ?? buildAiMatchNote(card)}</p>
-                        {(selectedColor || card.colorHint) && (
-                          <div className="workspace-chip-row">
-                            {selectedColor && <span className="workspace-chip">Rəng: {selectedColor}</span>}
-                            {!selectedColor && card.colorHint && (
-                              <span className="workspace-chip ghost">İpucu: {card.colorHint}</span>
-                            )}
-                          </div>
-                        )}
-                        {buildAiMetaPreview(card.aiAnalysis) && (
-                          <small>{buildAiMetaPreview(card.aiAnalysis)}</small>
-                        )}
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => resetUploadSelection(card.id)}
-                        >
-                          Seçimi dəyiş
-                        </button>
-                      </div>
-                    </article>
-                  )
-                })}
+                    return (
+                      <article className="workspace-selected-card" key={card.id}>
+                        <img src={card.previewUrl} alt={card.fileName} />
+                        <div>
+                          <strong>{card.selectedTitle ?? card.fileName}</strong>
+                          <p>{card.aiMatchNote ?? buildAiMatchNote(card)}</p>
+                          {(selectedColor || card.colorHint) && (
+                            <div className="workspace-chip-row">
+                              {selectedColor && (
+                                <span className="workspace-chip">Rəng: {selectedColor}</span>
+                              )}
+                              {!selectedColor && card.colorHint && (
+                                <span className="workspace-chip ghost">İpucu: {card.colorHint}</span>
+                              )}
+                            </div>
+                          )}
+                          {buildAiMetaPreview(card.aiAnalysis) && (
+                            <small>{buildAiMetaPreview(card.aiAnalysis)}</small>
+                          )}
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() => resetUploadSelection(card.id)}
+                          >
+                            Seçimi dəyiş
+                          </button>
+                        </div>
+                      </article>
+                    )
+                  })}
+                </div>
               </div>
             </section>
           )}
@@ -2885,28 +3164,64 @@ function App() {
                   <p className="workspace-kicker subtle">AI review board</p>
                   <h2>Şübhəli kartları sürətli şəkildə həll et</h2>
                 </div>
-                <span>{reviewUploadCards.length + unmatchedUploadCards.length} kart gözləyir</span>
+                <span>
+                  {activeReviewSearch
+                    ? `${reviewVisibleCount}/${reviewUploadCards.length + unmatchedUploadCards.length} kart görünür`
+                    : `${reviewUploadCards.length + unmatchedUploadCards.length} kart gözləyir`}
+                </span>
               </div>
               <p className="workspace-board-copy">
                 Sol tərəfdə AI-nin namizəd tapdığı kartlar, sağ tərəfdə isə feed-də
-                etibarlı SKU tapılmayanlar var. Hər sütun ayrıca scroll olur ki ekran boş görünməsin.
+                etibarlı SKU tapılmayanlar var. Hər sütunda bütün kartlar görünür; artıq
+                süni limit yoxdur.
               </p>
+              <div className="workspace-review-toolbar">
+                <label className="workspace-review-search">
+                  <span>Batch içində axtar</span>
+                  <input
+                    type="search"
+                    placeholder="Fayl adı, model, brend, rəng və ya SKU yaz"
+                    value={reviewSearchQuery}
+                    onChange={(e) => setReviewSearchQuery(e.target.value)}
+                  />
+                </label>
+                <div className="workspace-review-summary">
+                  <span>{filteredReviewUploadCards.length} namizədli</span>
+                  <span>{filteredUnmatchedUploadCards.length} tapılmayan</span>
+                  <span>Limit yoxdur</span>
+                  {reviewSearchQuery.trim() && (
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      onClick={() => setReviewSearchQuery('')}
+                    >
+                      Filtri sil
+                    </button>
+                  )}
+                </div>
+              </div>
 
               <div className="workspace-review-grid">
                 <div className="workspace-review-column">
                   <div className="workspace-column-head">
                     <strong>Namizəd tapılanlar</strong>
-                    <span>{reviewUploadCards.length}</span>
+                    <span>
+                      {activeReviewSearch
+                        ? `${filteredReviewUploadCards.length}/${reviewUploadCards.length}`
+                        : reviewUploadCards.length}
+                    </span>
                   </div>
 
                   <div className="workspace-review-list">
-                    {reviewUploadCards.length === 0 && (
+                    {filteredReviewUploadCards.length === 0 && (
                       <p className="workspace-inline-note">
-                        Hazırda review gözləyən AI namizədi yoxdur.
+                        {activeReviewSearch
+                          ? 'Bu filter ilə review kartı tapılmadı.'
+                          : 'Hazırda review gözləyən AI namizədi yoxdur.'}
                       </p>
                     )}
 
-                    {reviewUploadCards.slice(0, 12).map((card) => (
+                    {filteredReviewUploadCards.map((card) => (
                       <article className="vision-card" key={card.id}>
                         <div className="vision-card-media">
                           <img src={card.previewUrl} alt={card.fileName} />
@@ -2923,7 +3238,7 @@ function App() {
                           </div>
 
                           <div className="workspace-chip-row">
-                            {buildAiAnalysisChips(card.aiAnalysis).slice(0, 4).map((chip) => (
+                            {buildAiAnalysisChips(card.aiAnalysis).slice(0, 3).map((chip) => (
                               <span key={chip} className="workspace-chip">
                                 {chip}
                               </span>
@@ -2935,7 +3250,7 @@ function App() {
 
                           {card.aiAnalysis?.matchSignals.length ? (
                             <div className="vision-signals">
-                              {card.aiAnalysis.matchSignals.slice(0, 3).map((signal) => (
+                              {card.aiAnalysis.matchSignals.slice(0, 2).map((signal) => (
                                 <span key={signal}>{signal}</span>
                               ))}
                             </div>
@@ -2950,7 +3265,7 @@ function App() {
                             </div>
                           )}
 
-                          {card.candidates.length > 4 && (
+                          {card.candidates.length > 3 && (
                             <div className="workspace-inline-actions">
                               <button
                                 type="button"
@@ -2959,7 +3274,7 @@ function App() {
                               >
                                 {expandedCandidates[card.id]
                                   ? 'Yığ'
-                                  : `Daha çox (${card.candidates.length - 4})`}
+                                  : `Daha çox (${card.candidates.length - 3})`}
                               </button>
                             </div>
                           )}
@@ -2967,7 +3282,7 @@ function App() {
                           <div className="vision-candidate-list">
                             {(expandedCandidates[card.id]
                               ? card.candidates
-                              : card.candidates.slice(0, 4)
+                              : card.candidates.slice(0, 3)
                             ).map((candidate) => {
                               const color = productColorById[candidate.contentId]
                               const aiPicked =
@@ -3024,17 +3339,23 @@ function App() {
                 <div className="workspace-review-column">
                   <div className="workspace-column-head">
                     <strong>Feed-də tapılmayanlar</strong>
-                    <span>{unmatchedUploadCards.length}</span>
+                    <span>
+                      {activeReviewSearch
+                        ? `${filteredUnmatchedUploadCards.length}/${unmatchedUploadCards.length}`
+                        : unmatchedUploadCards.length}
+                    </span>
                   </div>
 
                   <div className="workspace-review-list">
-                    {unmatchedUploadCards.length === 0 && (
+                    {filteredUnmatchedUploadCards.length === 0 && (
                       <p className="workspace-inline-note">
-                        Hazırda ayrıca həll tələb edən tapılmayan kart yoxdur.
+                        {activeReviewSearch
+                          ? 'Bu filter ilə tapılmayan kart çıxmadı.'
+                          : 'Hazırda ayrıca həll tələb edən tapılmayan kart yoxdur.'}
                       </p>
                     )}
 
-                    {unmatchedUploadCards.slice(0, 12).map((card) => (
+                    {filteredUnmatchedUploadCards.map((card) => (
                       <article className="vision-card unmatched" key={card.id}>
                         <div className="vision-card-media">
                           <img src={card.previewUrl} alt={card.fileName} />
@@ -3047,7 +3368,7 @@ function App() {
                           </div>
 
                           <div className="workspace-chip-row">
-                            {buildAiAnalysisChips(card.aiAnalysis).slice(0, 4).map((chip) => (
+                            {buildAiAnalysisChips(card.aiAnalysis).slice(0, 3).map((chip) => (
                               <span key={chip} className="workspace-chip">
                                 {chip}
                               </span>
@@ -3593,955 +3914,8 @@ function App() {
         </div>
       </div>
 
-      {SHOW_LEGACY_CONSOLE && (
-        <div className="legacy-console" aria-hidden="true">
-          <div className="app">
-        <header className="hero hero-prime card">
-          <div className="hero-copy">
-            <p className="eyebrow">myshops.az -&gt; Meta Commerce</p>
-            <h1>
-              MyShops <span>Catalog</span> Builder
-            </h1>
-            <p className="lead">
-              `products.xml` feed-ni yukleyin, mehsul adini tapin, cədvəldə
-              redakte edin, sekil/video URL elave edin ve Meta CSV yukleyin.
-            </p>
-            <div className="hero-pills">
-              <span>AI match engine</span>
-              <span>Live price refresh</span>
-              <span>Meta-ready export</span>
-            </div>
-          </div>
-          <div className="hero-side">
-            <div className="hero-stats">
-              <div>
-                <strong>{feedItems.length}</strong>
-                <span>Feed item</span>
-              </div>
-              <div>
-                <strong>{matches.length}</strong>
-                <span>Tapilan</span>
-              </div>
-              <div>
-                <strong>{rows.length}</strong>
-                <span>Table row</span>
-              </div>
-            </div>
-            <div className="hero-flow">
-              <div>
-                <strong>01</strong>
-                <span>Feed ve qiymetleri cek</span>
-              </div>
-              <div>
-                <strong>02</strong>
-                <span>Sekillerle uyqun mehsulu sec</span>
-              </div>
-              <div>
-                <strong>03</strong>
-                <span>Meta ucun temiz CSV cixart</span>
-              </div>
-            </div>
-            <p className="hero-note">
-              Bir panelde axtaris, sekil secimi, media linkleri ve export axini.
-            </p>
-          </div>
-        </header>
+      {/* Legacy console removed — Obsidian Studio redesign */}
 
-        <section className="panel panel-feed card reveal">
-          <div className="section-heading">
-            <span className="section-kicker">01</span>
-            <div>
-              <h2>Feed yukleme</h2>
-              <p className="section-copy">
-                XML axinini cek, kateqoriyalari ve esas mehsul datalarini is masasına getir.
-              </p>
-            </div>
-          </div>
-          <div className="row-actions">
-            <button type="button" onClick={loadFeed} disabled={loadingFeed}>
-              {loadingFeed ? 'Yuklenir...' : 'products.xml yukle'}
-            </button>
-            <span className="hint">
-              Dev proxy: <code>{FEED_URL}</code> -&gt; myshops.az/products.xml
-            </span>
-          </div>
-          {feedError && <p className="error">{feedError}</p>}
-          {feedItems.length > 0 && (
-            <p className="ok">{feedItems.length} mehsul feed-den oxundu.</p>
-          )}
-        </section>
-
-        <section className="panel panel-search card reveal">
-          <div className="section-heading">
-            <span className="section-kicker">02</span>
-            <div>
-              <h2>Ada gore axtaris</h2>
-              <p className="section-copy">
-                Ad yazaraq uyğun mehsullari aninda tap, qiymeti real API ile yoxla ve cedvele sal.
-              </p>
-            </div>
-          </div>
-          <div className="search-row">
-            <input
-              type="search"
-              placeholder="Mes: iPhone 16, Samsung Galaxy..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="search-input"
-            />
-            <span className="hint strong">
-              {searchQuery.trim() ? `${matches.length} uygun netice` : 'Sorgu yazin'}
-            </span>
-          </div>
-
-          {matches.length > 0 && (
-            <ul className="preview-list">
-              {matches.slice(0, 8).map((item) => (
-                <li key={`${item.contentId}-${item.title}`}>
-                  <strong>{item.title}</strong>
-                  <span>{item.price}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <div className="row-actions">
-            <button
-              type="button"
-              onClick={addMatchesToTable}
-              disabled={matches.length === 0 || loadingLivePrices}
-            >
-              {loadingLivePrices
-                ? `Qiymetler cekilir... (${matches.length})`
-                : `Uygunlari cedvele elave et (${matches.length})`}
-            </button>
-          </div>
-          <p className="hint">
-            Bu addimda <code>Price</code> ve <code>Sale price</code> XML-den deyil,
-            real mehsul API-lerinden cekilir.
-          </p>
-        </section>
-
-        <section className="panel panel-batch card reveal">
-          <div className="section-heading">
-            <span className="section-kicker">03</span>
-            <div>
-              <h2>Sekil adlari ile batch tapma</h2>
-              <p className="section-copy">
-                Yuzlerle sekli bir defe yukle, AI ile tanit ve yanlis secimleri kart uzerinden rahat duzelt.
-              </p>
-            </div>
-          </div>
-          <div className="row-actions">
-            <label className="upload-picker">
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                onChange={handleBatchImageUpload}
-                disabled={processingUploads}
-              />
-              <span>
-                {processingUploads ? 'Sekiller islenir...' : 'Sekilleri yukle ve adla axtar'}
-              </span>
-            </label>
-            <button
-              type="button"
-              onClick={clearUploadMatches}
-              disabled={uploadMatches.length === 0}
-            >
-              Siyahini temizle
-            </button>
-            <button
-              type="button"
-              onClick={bulkSelectTopCandidates}
-              disabled={uploadStats.needsChoice === 0 || loadingLivePrices}
-              className="primary"
-            >
-              {loadingLivePrices
-                ? 'Toplu secim...'
-                : `Top 1-leri toplu sec (${uploadStats.needsChoice})`}
-            </button>
-          </div>
-
-          <p className="hint">
-            Fayl adindan sorgu qurulur. 1 netice tapilsa avtomatik cedvele dusur.
-            2 ve daha cox neticede sekilin altinda secim siyahisi acilir.
-            Deyiq olmayan hallarda sekilden AI oxunusu (fallback OCR) ile ad tapilaraq
-            netice guclendirilir. Bir batch-da 300 sekile qeder desteklenir.
-          </p>
-          <p className="hint">
-            Cox kart oldugunda `Top 1-leri toplu sec` ile bir klikle secin,
-            yanlis olanlari kartdan `Sechimi deyish` ile duzeldin.
-          </p>
-          <p className="hint warning">
-            Secim olunan kartlarin sekilleri Meta ucun public URL almaq ucun
-            `catbox.moe` servisine yuklenir.
-          </p>
-
-          {uploadNotice && <p className="hint warning">{uploadNotice}</p>}
-          {aiReadProgress && aiReadProgress.total > 0 && (
-            <p className="hint">
-              AI oxunusu: {aiReadProgress.done}/{aiReadProgress.total}
-            </p>
-          )}
-
-          {uploadMatches.length > 0 && (
-            <>
-              <div className="upload-stats">
-                <span className="stat-pill ok">Auto: {uploadStats.autoAdded}</span>
-                <span className="stat-pill info">Secim: {uploadStats.needsChoice}</span>
-                <span className="stat-pill done">Secildi: {uploadStats.chosen}</span>
-                <span className="stat-pill warn">Tapilmadi: {uploadStats.notFound}</span>
-              </div>
-
-              <div className="upload-grid">
-                {uploadMatches.map((card) => {
-                  const selectedColor = card.selectedContentId
-                    ? productColorById[card.selectedContentId]
-                    : ''
-
-                  return (
-                    <article className={`upload-card status-${card.status}`} key={card.id}>
-                    <img src={card.previewUrl} alt={card.fileName} className="upload-preview" />
-                    <div className="upload-card-body">
-                      <strong className="file-name" title={card.fileName}>
-                        {card.fileName}
-                      </strong>
-                      <p className="muted">
-                        Sorgu: <code>{card.query || '-'}</code>
-                      </p>
-                      {card.ocrQuery && (
-                        <p className="muted">
-                          AI/OCR: <code>{card.ocrQuery}</code>
-                        </p>
-                      )}
-                      {card.colorHint && (
-                        <p className="muted">
-                          AI reng ipucu: <code>{card.colorHint}</code>
-                        </p>
-                      )}
-                      {card.mediaUploading && (
-                        <p className="status-text info">Sekil public URL-e yuklenir...</p>
-                      )}
-                      {card.uploadedMediaUrl && (
-                        <p className="status-text info">
-                          Public sekil hazirdir:
-                          <a href={card.uploadedMediaUrl} target="_blank" rel="noreferrer">
-                            ac
-                          </a>
-                        </p>
-                      )}
-                      {card.mediaUploadError && (
-                        <p className="status-text warn">Sekil upload xetasi: {card.mediaUploadError}</p>
-                      )}
-
-                      {card.status === 'auto-added' && (
-                        <>
-                          <p className="status-text ok">
-                            Avtomatik elave olundu: {card.selectedTitle}
-                          </p>
-                          {selectedColor && (
-                            <p className="status-text info">Secilen reng: {selectedColor}</p>
-                          )}
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            onClick={() => resetUploadSelection(card.id)}
-                          >
-                            Uygun deyil, yeniden sec
-                          </button>
-                        </>
-                      )}
-
-                      {card.status === 'chosen' && (
-                        <>
-                          <p className="status-text done">Secildi: {card.selectedTitle}</p>
-                          {selectedColor && (
-                            <p className="status-text info">Secilen reng: {selectedColor}</p>
-                          )}
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            onClick={() => resetUploadSelection(card.id)}
-                          >
-                            Sechimi deyish
-                          </button>
-                        </>
-                      )}
-
-                      {card.status === 'not-found' && (
-                        <p className="status-text warn">Uygun mehsul tapilmadi.</p>
-                      )}
-
-                      {(card.status === 'not-found' || card.status === 'needs-choice') && (
-                        <div className="manual-search">
-                          <label htmlFor={`manual-search-${card.id}`}>Manual axtar</label>
-                          <div className="manual-search-row">
-                            <input
-                              id={`manual-search-${card.id}`}
-                              type="search"
-                              value={manualSearchDrafts[card.id] ?? ''}
-                              placeholder="Mes: Samsung Galaxy A17 128GB"
-                              onChange={(e) =>
-                                updateUploadSearchDraft(card.id, e.target.value)
-                              }
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                  e.preventDefault()
-                                  void searchUploadCardByDraft(card.id)
-                                }
-                              }}
-                            />
-                            <button
-                              type="button"
-                              className="mini-btn"
-                              onClick={() => void searchUploadCardByDraft(card.id)}
-                              disabled={loadingFeed}
-                            >
-                              Axtar
-                            </button>
-                          </div>
-                        </div>
-                      )}
-
-                      {card.status === 'needs-choice' && (
-                        <div className="candidate-list">
-                          <div className="candidate-tools">
-                            <button
-                              type="button"
-                              className="mini-btn"
-                              onClick={() =>
-                                selectUploadCandidate(card.id, card.candidates[0], card.previewUrl)
-                              }
-                              disabled={loadingLivePrices || card.candidates.length === 0}
-                            >
-                              Tovsiyeni sec
-                            </button>
-                            {card.candidates.length > 5 && (
-                              <button
-                                type="button"
-                                className="mini-btn"
-                                onClick={() => toggleCandidateExpand(card.id)}
-                              >
-                                {expandedCandidates[card.id]
-                                  ? 'Qisalt'
-                                  : `Daha cox (${card.candidates.length - 5})`}
-                              </button>
-                            )}
-                          </div>
-
-                          {(expandedCandidates[card.id]
-                            ? card.candidates
-                            : card.candidates.slice(0, 5)
-                          ).map((candidate) => {
-                            const color = productColorById[candidate.contentId]
-                            return (
-                              <button
-                                type="button"
-                                key={candidate.contentId}
-                                className="candidate-btn"
-                                onClick={() =>
-                                  selectUploadCandidate(card.id, candidate, card.previewUrl)
-                                }
-                                disabled={loadingLivePrices}
-                              >
-                                <span>{candidate.title}</span>
-                                <small>
-                                  {candidate.price}
-                                  {candidate.brand ? ` • ${candidate.brand}` : ''}
-                                  {color ? ` • Reng: ${color}` : ''}
-                                </small>
-                              </button>
-                            )
-                          })}
-                          {!expandedCandidates[card.id] && card.candidates.length > 5 && (
-                            <p className="muted">
-                              Yalniz ilk 5 namized gosterilir.
-                            </p>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </article>
-                  )
-                })}
-              </div>
-            </>
-          )}
-        </section>
-
-        <section className="panel panel-table card reveal">
-          <div className="section-heading">
-            <span className="section-kicker">04</span>
-            <div>
-              <h2>Kataloq cedveli</h2>
-              <p className="section-copy">
-                Son yoxlamalari et, media linklerini tamamla ve Meta Commerce ucun ixrac et.
-              </p>
-            </div>
-          </div>
-          <div className="row-actions">
-            <button type="button" onClick={addEmptyRow}>
-              Bos setir elave et
-            </button>
-            <button
-              type="button"
-              onClick={refreshAllRowLivePrices}
-              disabled={rows.length === 0 || loadingLivePrices}
-            >
-              {loadingLivePrices ? 'Qiymetler yenilenir...' : 'Qiymetleri yenile'}
-            </button>
-            <button
-              type="button"
-              onClick={exportCsv}
-              disabled={rows.length === 0}
-              className="primary"
-            >
-              Meta CSV yukle
-            </button>
-          </div>
-
-          <div className="media-provider-panel">
-            <div className="media-provider-copy">
-              <strong>Avtomatik gorsel menbeyi</strong>
-              <p>
-                Yeni secilen mehsullar ucun `Gorseller ve videolar` sahesi bu menbeye gore
-                avtomatik doldurulacaq.
-              </p>
-            </div>
-            <div className="media-provider-switch">
-              {CATALOG_MEDIA_PROVIDERS.map((provider) => (
-                <button
-                  key={provider.id}
-                  type="button"
-                  className={`provider-chip ${
-                    catalogMediaProvider === provider.id ? 'active' : ''
-                  }`}
-                  onClick={() => {
-                    setCatalogMediaProvider(provider.id)
-                    setTableError(null)
-                  }}
-                >
-                  <span>{provider.label}</span>
-                  <small>{provider.description}</small>
-                </button>
-              ))}
-            </div>
-            <div className="row-actions media-provider-actions">
-              <button
-                type="button"
-                onClick={syncCatalogMediaToTable}
-                disabled={rows.length === 0}
-              >
-                Secileni Gorseller ve videolar sahesine uygula
-              </button>
-            </div>
-          </div>
-
-          <p className="hint">
-            Sekil/video ucun URL-leri vergul, noqte-vergul ve ya yeni setir ile
-            yaza bilersiniz. Asagidaki `Media URL elave et` hissesi ile tek tek
-            de artira bilersiniz.
-          </p>
-          <p className="hint">
-            Hal-hazirda secilen avtomatik menbe: <code>{catalogMediaProvider}</code>.
-            Batch secimden elave olunan yeni row-lar bu provider ile dolacaq.
-          </p>
-          <p className={`hint ${catalogExportReadyCount < rows.length ? 'warning' : ''}`}>
-            Export hazirligi: <strong>{catalogExportReadyCount}</strong> row tam hazirdir,
-            <strong> {catalogExportDeferredCount}</strong> row export zamani tamamlanacaq,
-            <strong> {catalogExportBlockedCount}</strong> row ise elle duzelis isteyir.
-          </p>
-          <p className="hint warning">
-            Qeyd: Yuklenen sekiller lokal preview ucundur. Meta CSV ucun public
-            (internetden acilan) URL lazimdir. `webp` sekiller export-da
-            avtomatik JPEG URL-e cevrilir.
-          </p>
-          <div aria-live="polite">
-            {tableNotice && <p className="ok">{tableNotice}</p>}
-            {tableError && <p className="error">{tableError}</p>}
-          </div>
-
-          <div className="table-wrap">
-            <table className="catalog-table">
-              <thead>
-                <tr>
-                  <th className="col-del">Sil</th>
-                  {HEADERS.map((header) => (
-                    <th key={header.key} className={header.wide ? 'col-wide' : ''}>
-                      {header.label}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {rows.length === 0 ? (
-                  <tr>
-                    <td colSpan={HEADERS.length + 1} className="empty-cell">
-                      Hele setir yoxdur. Feed-den secib elave edin ve ya bos
-                      setir yaradaraq manual doldurun.
-                    </td>
-                  </tr>
-                ) : (
-                  rows.map((row, rowIndex) => {
-                    const media = normalizeMedia(row.imagesAndVideos)
-                    const imageUrls = media.filter((value) => !VIDEO_EXT.test(value))
-                    const videoUrls = media.filter((value) => VIDEO_EXT.test(value))
-                    const localPreviewUrl = row._localPreviewUrl?.trim() ?? ''
-
-                    return (
-                      <tr key={row._rowId ?? `${row.contentId}-${rowIndex}`}>
-                        <td className="col-del">
-                          <button
-                            type="button"
-                            className="btn-icon"
-                            onClick={() => removeRow(rowIndex)}
-                            title="Sil"
-                          >
-                            x
-                          </button>
-                        </td>
-
-                        {HEADERS.map((header) => (
-                          <td
-                            key={header.key}
-                            className={header.wide ? 'col-wide' : ''}
-                          >
-                            {header.key === 'imagesAndVideos' ? (
-                              <div className="media-cell">
-                                <textarea
-                                  value={row[header.key]}
-                                  onChange={(e) =>
-                                    updateCell(rowIndex, header.key, e.target.value)
-                                  }
-                                  rows={4}
-                                  placeholder="Media URL-leri buraya yazin (her setirde bir URL)"
-                                />
-
-                                <div className="media-tools">
-                                  <input
-                                    type="url"
-                                    value={mediaDrafts[rowIndex] ?? ''}
-                                    placeholder="Media URL elave et"
-                                    onChange={(e) =>
-                                      updateMediaDraft(rowIndex, e.target.value)
-                                    }
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter') {
-                                        e.preventDefault()
-                                        appendMediaUrl(rowIndex)
-                                      }
-                                    }}
-                                  />
-                                  <button
-                                    type="button"
-                                    className="mini-btn"
-                                    onClick={() => appendMediaUrl(rowIndex)}
-                                  >
-                                    Elave et
-                                  </button>
-                                </div>
-
-                                <div className="media-preview">
-                                  {imageUrls.slice(0, 3).map((url) => (
-                                    <a
-                                      key={url}
-                                      href={url}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      className="thumb-link"
-                                      title={url}
-                                    >
-                                      <img src={url} alt="preview" loading="lazy" />
-                                    </a>
-                                  ))}
-                                  {videoUrls.slice(0, 2).map((url) => (
-                                    <a
-                                      key={url}
-                                      href={url}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      className="video-chip"
-                                      title={url}
-                                    >
-                                      video
-                                    </a>
-                                  ))}
-                                  {imageUrls.length === 0 && localPreviewUrl && (
-                                    <>
-                                      <span className="thumb-link" title="Local preview">
-                                        <img
-                                          src={localPreviewUrl}
-                                          alt="local preview"
-                                          loading="lazy"
-                                        />
-                                      </span>
-                                      <span className="muted">
-                                        Local preview (CSV-e daxil edilmir)
-                                      </span>
-                                    </>
-                                  )}
-                                  {media.length === 0 && !localPreviewUrl && (
-                                    <span className="muted">Media yoxdur</span>
-                                  )}
-                                </div>
-                              </div>
-                            ) : header.key === 'description' ? (
-                              <textarea
-                                value={row[header.key]}
-                                onChange={(e) =>
-                                  updateCell(rowIndex, header.key, e.target.value)
-                                }
-                                rows={3}
-                              />
-                            ) : (
-                              <input
-                                type="text"
-                                value={row[header.key]}
-                                onChange={(e) =>
-                                  updateCell(rowIndex, header.key, e.target.value)
-                                }
-                              />
-                            )}
-                          </td>
-                        ))}
-                      </tr>
-                    )
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <section className="panel panel-lab card reveal">
-          <div className="section-heading">
-            <span className="section-kicker">05</span>
-            <div>
-              <h2>Media test laboratoriyasi</h2>
-              <p className="section-copy">
-                Hazirki export axini oldugu kimi saxlayiriq. Burada ise alternativ sekil
-                link strategiyalarini ayri feed kimi yoxlayib hansinin Meta-da daha stabil
-                islediyini secirik.
-              </p>
-            </div>
-          </div>
-
-          <div className="lab-mode-grid">
-            {MEDIA_LAB_MODES.map((mode) => {
-              const result = mediaLabResults[mode.id]
-              return (
-                <button
-                  type="button"
-                  key={mode.id}
-                  className={`lab-mode-card ${mediaLabMode === mode.id ? 'active' : ''}`}
-                  onClick={() => {
-                    setMediaLabMode(mode.id)
-                    setMediaLabError(null)
-                    setMediaLabNotice(null)
-                  }}
-                >
-                  <div>
-                    <strong>{mode.label}</strong>
-                    <p>{mode.description}</p>
-                  </div>
-                  <div className="lab-mode-meta">
-                    <span>{mediaLabReadyCounts[mode.id]} setir hazir</span>
-                    {result && (
-                      <span className={`lab-result ${result}`}>
-                        {result === 'works' ? 'Isledi' : 'Islemedi'}
-                      </span>
-                    )}
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-
-          <div className="row-actions lab-actions">
-            <button
-              type="button"
-              onClick={exportMediaLabCsv}
-              disabled={rows.length === 0}
-            >
-              Test CSV export et
-            </button>
-            <button
-              type="button"
-              onClick={applyMediaLabModeToRows}
-              disabled={rows.length === 0 || mediaLabMode === 'current'}
-            >
-              Isleyen variant kimi esas cedvele kocur
-            </button>
-            <button
-              type="button"
-              className="ghost-success"
-              onClick={() => markMediaLabResult(mediaLabMode, 'works')}
-            >
-              Isledi kimi qeyd et
-            </button>
-            <button
-              type="button"
-              className="ghost-warn"
-              onClick={() => markMediaLabResult(mediaLabMode, 'fails')}
-            >
-              Islemedi kimi qeyd et
-            </button>
-            {mediaLabMode === 'google-drive' && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void connectGoogleDrive()}
-                  disabled={driveBusy}
-                >
-                  {driveConnected ? 'Drive-i yeniden bagla' : 'Google Drive-a baglan'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void uploadRowsToGoogleDrive()}
-                  disabled={driveBusy || rows.length === 0}
-                >
-                  {driveBusy ? 'Drive upload...' : 'Local sekilleri Drive-a yukle'}
-                </button>
-                <button
-                  type="button"
-                  className="ghost-neutral"
-                  onClick={disconnectGoogleDrive}
-                  disabled={driveBusy || !driveConnected}
-                >
-                  Drive baglantisini sil
-                </button>
-              </>
-            )}
-          </div>
-
-          <p className="hint">
-            Bu hisse hal-hazirda URL testi ucundur. Yani Google Sheets / Drive avtomatik upload
-            henuz qosulmur; amma share/public linkleri ayri test feed kimi rahat yoxlaya bilirik.
-          </p>
-
-          {mediaLabMode === 'google-drive' && (
-            <>
-              <p className="hint">
-                Drive modu ucun share linki yapisdira bilersen. Sistem onu experimental olaraq
-                <code>drive.google.com/uc?export=view&amp;id=...</code> formatina cevirir.
-                Google auth islesin diye OAuth client icinde Authorized JavaScript origins
-                hissesine <code>http://localhost:3007</code> elave olunmalidir.
-              </p>
-              <p className="hint warning">
-                Eger Google popup-da <code>403 access_denied</code> gorursense, Google Auth Platform
-                icinde <code>Audience</code> bolmesine girib istifade etdiyin Gmail hesabini
-                <code>Test users</code> siyahisina elave et.
-              </p>
-              <p className="hint">
-                Eger page refresh olunubsa ve toplu Drive upload bos qalirsa, her row-un altindaki
-                <code>Bu row ucun sekil sec ve Drive-a yukle</code> duymesi ile sekli yeniden secib
-                birbasa Drive-a yukleye bilersen.
-              </p>
-            </>
-          )}
-          {mediaLabMode === 'gcs-public' && (
-            <p className="hint">
-              GCS modu ucun public object URL daxil et, meselen
-              <code> https://storage.googleapis.com/bucket/file.jpg</code>.
-            </p>
-          )}
-
-          {mediaLabNotice && <p className="ok">{mediaLabNotice}</p>}
-          {mediaLabError && <p className="error">{mediaLabError}</p>}
-          {driveStatus && <p className="hint">{driveStatus}</p>}
-
-          {rows.length === 0 ? (
-            <div className="lab-empty">
-              Evvelce mehsullari cedvele sal. Sonra burada ayri media strategiyalarini test feed
-              kimi cixarib muqayise ede bilerik.
-            </div>
-          ) : mediaLabMode === 'current' ? (
-            <div className="lab-baseline-grid">
-              {rows.slice(0, 12).map((row, rowIndex) => {
-                const currentImage = getCurrentPrimaryImage(row)
-                const sourceLabel = normalizeMedia(row.imagesAndVideos).some(
-                  (value) => !VIDEO_EXT.test(value) && isPublicHttpUrl(value),
-                )
-                  ? 'Custom public URL'
-                  : row._fallbackImageLink
-                    ? 'Feed fallback'
-                    : 'Sekil yoxdur'
-
-                return (
-                  <article
-                    className="lab-baseline-card"
-                    key={row._rowId ?? `${row.contentId}-${rowIndex}`}
-                  >
-                    <strong>{row.title || `Setir ${rowIndex + 1}`}</strong>
-                    <span>{sourceLabel}</span>
-                    {isPublicHttpUrl(currentImage) ? (
-                      <a href={currentImage} target="_blank" rel="noreferrer">
-                        Cari sekili ac
-                      </a>
-                    ) : (
-                      <span className="muted">Public image yoxdur</span>
-                    )}
-                  </article>
-                )
-              })}
-              {rows.length > 12 && (
-                <p className="muted">
-                  Baseline baxisinda ilk 12 setir gosterilir. Export ise butun cedveli istifade edir.
-                </p>
-              )}
-            </div>
-          ) : (
-            <div className="table-wrap lab-table-wrap">
-              <table className="catalog-table lab-table">
-                <thead>
-                  <tr>
-                    <th>Mehsul</th>
-                    <th>Indiki sekil menbeyi</th>
-                    <th>{mediaLabMode === 'google-drive' ? 'Drive linki' : 'GCS public URL'}</th>
-                    <th>Test URL preview</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((row, rowIndex) => {
-                    const rowKey = getRowLabKey(row, rowIndex)
-                    const entry = mediaLabEntries[rowKey]
-                    const currentImage = getCurrentPrimaryImage(row)
-                    const value =
-                      mediaLabMode === 'google-drive' ? entry?.driveUrl ?? '' : entry?.gcsUrl ?? ''
-                    const previewUrl = getMediaLabUrl(mediaLabMode, entry)
-
-                    return (
-                      <tr key={rowKey}>
-                        <td>
-                          <div className="lab-product-cell">
-                            <strong>{row.title || `Setir ${rowIndex + 1}`}</strong>
-                            <span>{row.contentId || 'Content ID yoxdur'}</span>
-                          </div>
-                        </td>
-                        <td>
-                          {isPublicHttpUrl(currentImage) ? (
-                            <a href={currentImage} target="_blank" rel="noreferrer">
-                              Cari sekili ac
-                            </a>
-                          ) : (
-                            <span className="muted">Public image yoxdur</span>
-                          )}
-                        </td>
-                        <td>
-                          <div className="lab-input-stack">
-                            <input
-                              type="text"
-                              value={value}
-                              placeholder={
-                                mediaLabMode === 'google-drive'
-                                  ? 'Drive share linki ve ya file id'
-                                  : 'https://storage.googleapis.com/...'
-                              }
-                              onChange={(e) =>
-                                updateMediaLabEntry(
-                                  rowKey,
-                                  mediaLabMode === 'google-drive' ? 'driveUrl' : 'gcsUrl',
-                                  e.target.value,
-                                )
-                              }
-                            />
-                            {mediaLabMode === 'google-drive' && (
-                              <label className="lab-file-picker">
-                                <input
-                                  type="file"
-                                  accept="image/*"
-                                  onChange={(e) => {
-                                    const file = e.target.files?.[0] ?? null
-                                    void uploadSingleRowToGoogleDrive(rowKey, file)
-                                    e.currentTarget.value = ''
-                                  }}
-                                />
-                                <span>Bu row ucun sekil sec ve Drive-a yukle</span>
-                              </label>
-                            )}
-                            {mediaLabMode === 'google-drive' && entry?.selectedLocalFileName && (
-                              <span className="muted">
-                                Son secilen fayl: {entry.selectedLocalFileName}
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td>
-                          {isPublicHttpUrl(previewUrl) ? (
-                            <div className="lab-preview-cell">
-                              <a href={previewUrl} target="_blank" rel="noreferrer">
-                                Test URL ac
-                              </a>
-                              {mediaLabMode === 'google-drive' && entry?.driveViewUrl && (
-                                <a href={entry.driveViewUrl} target="_blank" rel="noreferrer">
-                                  Drive faylini ac
-                                </a>
-                              )}
-                              <code>{previewUrl}</code>
-                              {mediaLabMode === 'google-drive' && entry?.driveFileId && (
-                                <span className="muted">Drive file id: {entry.driveFileId}</span>
-                              )}
-                              {entry?.driveMessage && (
-                                <span
-                                  className={`muted ${
-                                    entry.driveState === 'error' ? 'warn-text' : ''
-                                  }`}
-                                >
-                                  {entry.driveMessage}
-                                </span>
-                              )}
-                            </div>
-                          ) : value.trim() ? (
-                            <div className="lab-preview-cell">
-                              <span className="muted">Duzgun public URL alinmadi</span>
-                              {entry?.driveMessage && (
-                                <span
-                                  className={`muted ${
-                                    entry.driveState === 'error' ? 'warn-text' : ''
-                                  }`}
-                                >
-                                  {entry.driveMessage}
-                                </span>
-                              )}
-                            </div>
-                          ) : (
-                            <div className="lab-preview-cell">
-                              <span className="muted">Hele daxil edilmeyib</span>
-                              {entry?.driveMessage && (
-                                <span className="muted">{entry.driveMessage}</span>
-                              )}
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        <footer className="footer footer-meta card reveal">
-          <p>
-            CSV output Meta katalog formatina uygundur: <code>id</code>,{' '}
-            <code>title</code>, <code>description</code>,{' '}
-            <code>availability</code>, <code>condition</code>, <code>price</code>,{' '}
-            <code>link</code>, <code>image_link</code>,{' '}
-            <code>additional_image_link</code>, <code>brand</code>,{' '}
-            <code>sale_price</code>, <code>fb_product_category</code>,{' '}
-            <code>video_url</code>.
-          </p>
-          <p className="muted">
-            `Status` sahesi table-de saxlanir, amma Meta standart feed sutunlarina
-            daxil edilmir.
-          </p>
-        </footer>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

@@ -2,7 +2,7 @@ import type { ParsedItem } from './feedParser'
 
 const GEMINI_ENDPOINT_BASE = '/proxy-gemini/models'
 const OPENAI_RESPONSES_ENDPOINT = '/proxy-openai/v1/responses'
-const DEFAULT_GEMINI_MODEL = 'gemini-3.1-pro-preview'
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
 const DEFAULT_OPENAI_MODEL = 'gpt-5.4'
 const AI_REQUEST_TIMEOUT_MS = 40000
 const PRODUCT_ANALYSIS_PROMPT = `Return JSON only.
@@ -62,11 +62,12 @@ ${JSON.stringify(summarizedCandidates, null, 2)}`
 }
 
 const DEFAULT_GEMINI_MODEL_PRIORITY = [
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
   'gemini-3.1-pro-preview',
   'gemini-3-flash-preview',
-  'gemini-2.5-pro',
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
 ]
 
 const DEFAULT_OPENAI_MODEL_PRIORITY = [
@@ -728,7 +729,7 @@ export async function analyzeProductImageAi(file: File): Promise<ImageProductAna
   const primary = await callImageJsonTask(
     image,
     PRODUCT_ANALYSIS_PROMPT,
-    'myshops_product_analysis',
+    'catalog_product_analysis',
     ANALYSIS_SCHEMA,
     parseImageProductAnalysis,
   )
@@ -737,7 +738,7 @@ export async function analyzeProductImageAi(file: File): Promise<ImageProductAna
   return callImageJsonTask(
     image,
     PRODUCT_ANALYSIS_FALLBACK_PROMPT,
-    'myshops_product_analysis_fallback',
+    'catalog_product_analysis_fallback',
     ANALYSIS_FALLBACK_SCHEMA,
     parseFallbackImageProductAnalysis,
   )
@@ -754,7 +755,7 @@ export async function chooseBestCatalogCandidateAi(
   return callImageJsonTask(
     image,
     buildCatalogDecisionPrompt(analysis, candidates, colorById),
-    'myshops_catalog_decision',
+    'catalog_candidate_decision',
     CATALOG_DECISION_SCHEMA,
     parseCatalogCandidateDecision,
   )
